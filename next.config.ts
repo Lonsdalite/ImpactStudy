@@ -18,7 +18,6 @@ export default withSentryConfig(nextConfig, {
   project: "javascript-nextjs",
   silent: !process.env.CI,
   widenClientFileUpload: true,
-  hideSourceMaps: true,
   // Optional: tunnels Sentry requests through our own domain to bypass
   // ad-blockers. Adds a /monitoring route. Off for Day 2 — re-enable later.
   // tunnelRoute: "/monitoring",
