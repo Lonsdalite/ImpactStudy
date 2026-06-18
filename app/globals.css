@@ -1,0 +1,80 @@
+@import "tailwindcss";
+
+/*
+ * ImpactStudy brand tokens.
+ * Locked in 11_Brand_Decision_and_Day_1_Checklist.md.
+ * Palette: plum / plum-mid / cream / sage / gold (certs only).
+ * Type: Inter for UI (400, 500); Fraunces for hero moments (400, 500).
+ */
+
+:root {
+  /* Brand palette */
+  --brand-plum: #3d2c4f;
+  --brand-plum-mid: #6b4a8a;
+  --brand-cream: #faf6f0;
+  --brand-sage: #7ba098;
+  --brand-gold: #c7a24b;
+  --brand-ink: #1f1b24;
+  --brand-mist: #e8e1d8;
+
+  /* Semantic mappings */
+  --background: var(--brand-cream);
+  --foreground: var(--brand-ink);
+  --primary: var(--brand-plum);
+  --primary-foreground: var(--brand-cream);
+  --secondary: var(--brand-plum-mid);
+  --muted: var(--brand-mist);
+  --muted-foreground: #6b6471;
+  --accent: var(--brand-sage);
+  --border: var(--brand-mist);
+  --ring: var(--brand-plum-mid);
+  --radius: 0.75rem;
+}
+
+@theme inline {
+  /* Make brand colors available as Tailwind utilities: bg-brand-plum, text-brand-cream, etc. */
+  --color-brand-plum: var(--brand-plum);
+  --color-brand-plum-mid: var(--brand-plum-mid);
+  --color-brand-cream: var(--brand-cream);
+  --color-brand-sage: var(--brand-sage);
+  --color-brand-gold: var(--brand-gold);
+  --color-brand-ink: var(--brand-ink);
+  --color-brand-mist: var(--brand-mist);
+
+  /* Semantic colors for shadcn primitives */
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-border: var(--border);
+  --color-ring: var(--ring);
+
+  /* Fonts (wired up in app/layout.tsx via next/font) */
+  --font-sans: var(--font-inter);
+  --font-display: var(--font-fraunces);
+
+  /* Radius scale */
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans), system-ui, -apple-system, sans-serif;
+  font-feature-settings: "cv11", "ss01", "ss03"; /* Inter stylistic alternates */
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Hero typography lock — Fraunces only in explicit places */
+.font-display {
+  font-family: var(--font-display), Georgia, serif;
+  font-feature-settings: "ss01"; /* Fraunces stylistic set */
+}
