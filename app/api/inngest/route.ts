@@ -12,6 +12,5 @@ const functions: never[] = [];
 
 export const { GET, POST, PUT } = serve({
   client: inngest,
-  // @ts-expect-error -- empty function array is fine; type tightens once we add jobs
   functions,
 });
