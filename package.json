@@ -7,9 +7,12 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "db:push": "drizzle-kit push",
+    "db:push": "drizzle-kit push && tsx lib/db/apply-policies.ts",
+    "db:push:only": "drizzle-kit push",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
+    "db:policies": "tsx lib/db/apply-policies.ts",
+    "db:seed": "tsx lib/db/seed.ts",
     "db:studio": "drizzle-kit studio"
   },
   "dependencies": {

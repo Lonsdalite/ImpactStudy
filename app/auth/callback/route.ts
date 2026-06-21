@@ -1,38 +1,49 @@
+import { type EmailOtpType } from "@supabase/supabase-js";
 import { type NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 
 /**
- * Supabase magic-link / OAuth callback.
+ * Supabase auth callback — handles BOTH flows:
  *
- * Email link flow:
- *   1. User requests magic link via /login (signInWithOtp)
- *   2. Supabase email template links to:
- *        https://<project>.supabase.co/auth/v1/verify?token=...&type=magiclink&redirect_to=<our-callback>
- *   3. Supabase verifies the token, redirects to our callback with ?code=<authCode>
- *   4. We exchange the code for a session cookie via exchangeCodeForSession
- *   5. Redirect to ?next= (or /dashboard by default)
+ * 1. Email magic link (PRIMARY) — `token_hash` + `type` → verifyOtp().
+ *    No PKCE code-verifier cookie required, so it survives the link being
+ *    opened in a different tab/app/webview. This is the robust SSR pattern.
+ *    Requires the Supabase "Magic Link" email template to point here with
+ *    token_hash (see lib/db/policies.sql sibling note / Day 3 doc).
+ *
+ * 2. OAuth / PKCE (FUTURE — Google/Apple) — `code` → exchangeCodeForSession().
+ *    Kept so social login works when we add it in Phase 1.
+ *
+ * On success → redirect to ?next= (default /dashboard).
  */
 export async function GET(request: NextRequest) {
   const requestUrl = new URL(request.url);
   const code = requestUrl.searchParams.get("code");
+  const tokenHash = requestUrl.searchParams.get("token_hash");
+  const type = requestUrl.searchParams.get("type") as EmailOtpType | null;
   const next = requestUrl.searchParams.get("next") ?? "/dashboard";
 
-  if (!code) {
+  const redirectToLogin = (message: string) => {
     const loginUrl = new URL("/login", request.url);
-    loginUrl.searchParams.set(
-      "message",
-      "Sign-in link is missing or expired. Try again.",
-    );
+    loginUrl.searchParams.set("message", message);
     return NextResponse.redirect(loginUrl);
-  }
+  };
 
   const supabase = await createClient();
-  const { error } = await supabase.auth.exchangeCodeForSession(code);
+  let error: { message: string } | null = null;
+
+  if (tokenHash && type) {
+    // Magic-link / email OTP flow — no verifier needed.
+    ({ error } = await supabase.auth.verifyOtp({ type, token_hash: tokenHash }));
+  } else if (code) {
+    // OAuth / PKCE flow.
+    ({ error } = await supabase.auth.exchangeCodeForSession(code));
+  } else {
+    return redirectToLogin("Sign-in link is missing or expired. Try again.");
+  }
 
   if (error) {
-    const loginUrl = new URL("/login", request.url);
-    loginUrl.searchParams.set("message", `Sign-in failed: ${error.message}`);
-    return NextResponse.redirect(loginUrl);
+    return redirectToLogin(`Sign-in failed: ${error.message}`);
   }
 
   // Handle deploy behind reverse proxy (Vercel sets x-forwarded-host correctly).

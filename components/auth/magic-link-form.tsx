@@ -60,10 +60,11 @@ export function MagicLinkForm({ next }: MagicLinkFormProps) {
 
     startTransition(async () => {
       const supabase = createClient();
+      // Always include ?next= so the email template can safely append
+      // "&token_hash=...&type=email" onto {{ .RedirectTo }} (the URL always has
+      // a query string, so the & is valid). Defaults to /dashboard.
       const redirectTo = new URL("/auth/callback", window.location.origin);
-      if (next) {
-        redirectTo.searchParams.set("next", next);
-      }
+      redirectTo.searchParams.set("next", next ?? "/dashboard");
 
       const { error } = await supabase.auth.signInWithOtp({
         email,
