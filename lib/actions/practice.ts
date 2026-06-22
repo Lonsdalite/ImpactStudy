@@ -6,6 +6,8 @@ import {
   generatePracticeSet,
   type PracticeSet,
 } from "@/lib/llm/generate-practice";
+import { FATIMA_VOICE } from "@/lib/llm/voice";
+import type { VoiceSignature } from "@/lib/voice-types";
 
 export async function generatePractice(input: {
   topic: string;
@@ -21,10 +23,22 @@ export async function generatePractice(input: {
   const topic = input.topic?.trim();
   if (!topic) return { ok: false, error: "Enter a topic first." };
 
+  const supabase = await createClient();
+
+  // Load this tenant's captured voice; fall back to the default if none yet.
+  const { data: tenantRow } = await supabase
+    .from("tenants")
+    .select("voice_signature")
+    .eq("id", res.tenant.tenantId)
+    .single();
+  const captured = (
+    tenantRow as unknown as { voice_signature: VoiceSignature | null } | null
+  )?.voice_signature;
+  const voice = captured ?? FATIMA_VOICE;
+
   let studentName: string | undefined;
   let yearLevel: string | undefined;
   if (input.studentId) {
-    const supabase = await createClient();
     const { data } = await supabase
       .from("students")
       .select("first_name, year_level")
@@ -41,7 +55,12 @@ export async function generatePractice(input: {
   }
 
   try {
-    const set = await generatePracticeSet({ topic, studentName, yearLevel });
+    const set = await generatePracticeSet({
+      topic,
+      voice,
+      studentName,
+      yearLevel,
+    });
     return { ok: true, set };
   } catch (e) {
     return {

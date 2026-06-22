@@ -28,6 +28,7 @@ import { drizzle } from "drizzle-orm/postgres-js";
 import { eq, inArray } from "drizzle-orm";
 import { createClient, type User } from "@supabase/supabase-js";
 import * as schema from "./schema";
+import { FATIMA_VOICE } from "../voice-types";
 
 // ---------- env ----------
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -139,10 +140,15 @@ async function main() {
       slug: "impactstudy",
       displayName: "ImpactStudy",
       brandColor: "#3D2C4F",
+      voiceSignature: FATIMA_VOICE,
     })
     .onConflictDoUpdate({
       target: schema.tenants.id,
-      set: { slug: "impactstudy", displayName: "ImpactStudy" },
+      set: {
+        slug: "impactstudy",
+        displayName: "ImpactStudy",
+        voiceSignature: FATIMA_VOICE,
+      },
     });
 
   // 3. Memberships (owner = staff; parents = parent role)

@@ -1,6 +1,7 @@
 import "server-only";
 
-import { FATIMA_VOICE, renderVoice } from "@/lib/llm/voice";
+import { renderVoice } from "@/lib/llm/voice";
+import type { VoiceSignature } from "@/lib/voice-types";
 
 /**
  * CEQR — Concept Extraction + Question Regeneration.
@@ -34,6 +35,7 @@ const DEFAULT_MODEL = "claude-sonnet-4-6";
 
 export async function generatePracticeSet(input: {
   topic: string;
+  voice: VoiceSignature;
   studentName?: string;
   yearLevel?: string;
   count?: number;
@@ -54,7 +56,7 @@ export async function generatePracticeSet(input: {
     "You write daily maths practice questions in a specific tutor's exact voice.",
     "The voice IS the product, so match it precisely.",
     "",
-    renderVoice(FATIMA_VOICE),
+    renderVoice(input.voice),
     "",
     "Rules:",
     `- Write ${count} ORIGINAL questions on the given topic. Never copy from any source; regenerate from the concept.`,

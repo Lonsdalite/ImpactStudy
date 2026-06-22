@@ -6,12 +6,14 @@ import {
   boolean,
   integer,
   date,
+  jsonb,
   pgEnum,
   index,
   unique,
   check,
 } from "drizzle-orm/pg-core";
 import { relations, sql } from "drizzle-orm";
+import type { VoiceSignature } from "@/lib/voice-types";
 
 /**
  * Roles inside a tenant. A user can have different roles in different tenants
@@ -45,6 +47,9 @@ export const tenants = pgTable("tenants", {
   slug: text("slug").notNull().unique(),
   displayName: text("display_name").notNull(),
   brandColor: text("brand_color").default("#3D2C4F").notNull(),
+  // The tutor's voice signature (Pedagogy Style Guide). NULL until captured;
+  // CEQR falls back to a default voice when null. See lib/voice-types.ts.
+  voiceSignature: jsonb("voice_signature").$type<VoiceSignature>(),
   createdAt: timestamp("created_at", { withTimezone: true })
     .defaultNow()
     .notNull(),

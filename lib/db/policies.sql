@@ -123,7 +123,7 @@ alter table public.tenant_corpus_subscriptions enable row level security;
 -- 3. Table grants to `authenticated` (PostgREST won't serve a table without
 --    a grant; RLS then filters which rows come back). anon stays locked out.
 -- ----------------------------------------------------------------------------
-grant select                         on public.tenants                     to authenticated;
+grant select, update                 on public.tenants                     to authenticated;
 grant select, update                 on public.users                       to authenticated;
 grant select                         on public.memberships                 to authenticated;
 grant select, insert, update, delete on public.students                    to authenticated;
@@ -140,6 +140,13 @@ drop policy if exists tenants_select_member on public.tenants;
 create policy tenants_select_member on public.tenants
   for select to authenticated
   using (id in (select public.current_tenant_ids()));
+
+-- Staff (owner/admin/tutor) can update their own tenant (voice signature, brand).
+drop policy if exists tenants_update_staff on public.tenants;
+create policy tenants_update_staff on public.tenants
+  for update to authenticated
+  using (public.is_tenant_staff(id))
+  with check (public.is_tenant_staff(id));
 
 -- ----------------------------------------------------------------------------
 -- 5. Policies — users (global identity; visibility derived via memberships)
