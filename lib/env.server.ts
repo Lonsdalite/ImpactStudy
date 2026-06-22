@@ -7,6 +7,14 @@ import { z } from "zod";
  * tries to use this module.
  */
 
+// Treat an empty-string env var as "not set". .env files and Vercel often leave
+// a key present but blank (e.g. `SENTRY_AUTH_TOKEN=`); without this, an optional
+// z.string().min(1) rejects "" and the whole validation throws.
+const optional = z.preprocess(
+  (v) => (v === "" ? undefined : v),
+  z.string().min(1).optional(),
+);
+
 const schema = z.object({
   SUPABASE_SECRET_KEY: z.string().min(1),
   DATABASE_URL: z.string().url(),
@@ -17,12 +25,16 @@ const schema = z.object({
   RESEND_API_KEY: z.string().min(1),
   RESEND_FROM_EMAIL: z.string().email(),
 
+  // Anthropic (voice-critical generation — CEQR practice, parent reports).
+  ANTHROPIC_API_KEY: optional,
+  ANTHROPIC_MODEL: optional,
+
   // Optional — wired up later
-  SENTRY_ORG: z.string().min(1).optional(),
-  SENTRY_PROJECT: z.string().min(1).optional(),
-  SENTRY_AUTH_TOKEN: z.string().min(1).optional(),
-  POSTHOG_PERSONAL_API_KEY: z.string().min(1).optional(),
-  CLOUDFLARE_ACCOUNT_ID: z.string().min(1).optional(),
+  SENTRY_ORG: optional,
+  SENTRY_PROJECT: optional,
+  SENTRY_AUTH_TOKEN: optional,
+  POSTHOG_PERSONAL_API_KEY: optional,
+  CLOUDFLARE_ACCOUNT_ID: optional,
 });
 
 const parsed = schema.safeParse(process.env);
