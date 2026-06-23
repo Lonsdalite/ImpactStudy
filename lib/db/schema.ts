@@ -327,6 +327,60 @@ export const payments = pgTable(
   ],
 );
 
+// ---------- reports (parent heartbeat) ----------
+// One persisted weekly progress note per student per billing-agnostic weekly
+// period. Lifecycle: draft (AI-written, tutor-only) -> approved (tutor signed
+// off) -> sent (delivered to parent). A parent may ONLY ever see approved/sent
+// rows (enforced in RLS, not just the UI). The voice output is split into
+// greeting/body/signoff so "Copy note" and email render identically; `stats` is
+// the snapshot of facts the note was written from (audit + anti-fabrication).
+// See 20_Product_UX_and_Moat.md §7.
+export const reportStatusEnum = pgEnum("report_status", [
+  "draft",
+  "approved",
+  "sent",
+]);
+
+export const reports = pgTable(
+  "reports",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    studentId: uuid("student_id")
+      .notNull()
+      .references(() => students.id, { onDelete: "cascade" }),
+    // Inclusive weekly window the note covers (YYYY-MM-DD).
+    periodStart: date("period_start").notNull(),
+    periodEnd: date("period_end").notNull(),
+    status: reportStatusEnum("status").default("draft").notNull(),
+    // Voice output (the soul). body is required; greeting/signoff optional.
+    greeting: text("greeting"),
+    body: text("body").notNull(),
+    signoff: text("signoff"),
+    model: text("model"), // which model wrote it (transparency)
+    // Snapshot of the computed facts (WeeklyStats) the note was grounded in.
+    stats: jsonb("stats"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    approvedAt: timestamp("approved_at", { withTimezone: true }),
+    approvedBy: uuid("approved_by").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    sentAt: timestamp("sent_at", { withTimezone: true }),
+  },
+  (t) => [
+    // One note per student per weekly period — re-drafting is an idempotent
+    // upsert that must never clobber an already-approved note (enforced in code).
+    unique("reports_student_period_unique").on(t.studentId, t.periodStart),
+    index("reports_tenant_idx").on(t.tenantId),
+    index("reports_student_idx").on(t.studentId),
+    index("reports_status_idx").on(t.status),
+  ],
+);
+
 // ---------- relations ----------
 // Drizzle relations API for ergonomic joins from query builder.
 
@@ -338,6 +392,7 @@ export const tenantsRelations = relations(tenants, ({ many }) => ({
   rateCards: many(rateCards),
   lessons: many(lessons),
   payments: many(payments),
+  reports: many(reports),
 }));
 
 export const corpusSourcesRelations = relations(
@@ -390,6 +445,7 @@ export const studentsRelations = relations(students, ({ one, many }) => ({
   parentLinks: many(studentParents),
   lessons: many(lessons),
   payments: many(payments),
+  reports: many(reports),
   defaultRateCard: one(rateCards, {
     fields: [students.defaultRateCardId],
     references: [rateCards.id],
@@ -428,6 +484,21 @@ export const lessonsRelations = relations(lessons, ({ one }) => ({
   rateCard: one(rateCards, {
     fields: [lessons.rateCardId],
     references: [rateCards.id],
+  }),
+}));
+
+export const reportsRelations = relations(reports, ({ one }) => ({
+  tenant: one(tenants, {
+    fields: [reports.tenantId],
+    references: [tenants.id],
+  }),
+  student: one(students, {
+    fields: [reports.studentId],
+    references: [students.id],
+  }),
+  approver: one(users, {
+    fields: [reports.approvedBy],
+    references: [users.id],
   }),
 }));
 
@@ -472,3 +543,6 @@ export type Payment = typeof payments.$inferSelect;
 export type NewPayment = typeof payments.$inferInsert;
 export type PaymentMethod = (typeof paymentMethodEnum.enumValues)[number];
 export type BillingCycle = (typeof billingCycleEnum.enumValues)[number];
+export type Report = typeof reports.$inferSelect;
+export type NewReport = typeof reports.$inferInsert;
+export type ReportStatus = (typeof reportStatusEnum.enumValues)[number];

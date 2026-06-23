@@ -22,6 +22,7 @@ interface LessonRow {
   student_id: string;
   status: LessonStatus;
   amount_cents: number;
+  note: string | null;
 }
 
 function addDays(iso: string, n: number): string {
@@ -78,7 +79,7 @@ export default async function AttendancePage({
       .order("first_name", { ascending: true }),
     supabase
       .from("lessons")
-      .select("student_id, status, amount_cents")
+      .select("student_id, status, amount_cents, note")
       .eq("tenant_id", tenant.tenantId)
       .eq("date", date),
   ]);
@@ -95,6 +96,7 @@ export default async function AttendancePage({
       rateCents: s.rate?.amount_cents ?? 0,
       status: lesson?.status ?? null,
       postedCents: lesson?.amount_cents ?? null,
+      note: lesson?.note ?? null,
     };
   });
 

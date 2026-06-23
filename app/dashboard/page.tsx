@@ -103,21 +103,28 @@ export default async function DashboardPage() {
             </Link>
           )}
 
-          <div className="flex flex-col rounded-2xl border border-brand-mist bg-white p-6">
+          <Link
+            href="/dashboard/reports"
+            className="flex flex-col rounded-2xl border border-brand-mist bg-white p-6 transition-colors hover:border-brand-plum/30"
+          >
             <span className="text-sm font-medium text-brand-plum">Reports</span>
-            <span className="mt-3 font-display text-4xl text-brand-ink/25">—</span>
-            <span className="mt-1 text-xs text-brand-ink/55">
-              Parent heartbeat · coming soon
+            <span className="mt-3 font-display text-4xl text-brand-plum">
+              {isParent ? "Progress" : "Heartbeat"}
             </span>
-          </div>
+            <span className="mt-1 text-xs text-brand-ink/55">
+              {isParent
+                ? "This week's wins, in your tutor's voice"
+                : "Weekly parent notes · in your voice"}
+            </span>
+          </Link>
         </div>
 
         <div className="mt-8 rounded-2xl border border-brand-plum/15 bg-brand-plum/[0.03] p-6">
           <h2 className="text-sm font-medium text-brand-plum">What&apos;s next</h2>
           <p className="mt-2 max-w-2xl text-sm leading-relaxed text-brand-ink/70">
-            Attendance and billing are live. Coming next: adaptive daily practice
-            for your students, and automatic progress reports for parents — all in
-            your voice.
+            Attendance, billing, and weekly progress notes are live. Coming next:
+            adaptive daily practice for your students, and automatic delivery of
+            those notes to parents — all in your voice.
           </p>
         </div>
       </div>

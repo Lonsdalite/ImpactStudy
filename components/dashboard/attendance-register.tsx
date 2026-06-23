@@ -1,6 +1,6 @@
 "use client";
 
-import { useTransition } from "react";
+import { useState, useTransition } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
@@ -9,6 +9,7 @@ import {
   markAllPresent,
   markAttendance,
   restoreLesson,
+  setLessonNote,
 } from "@/lib/actions/attendance";
 import type { LessonStatus } from "@/lib/db/schema";
 
@@ -18,6 +19,7 @@ export interface RegisterStudent {
   rateCents: number;
   status: LessonStatus | null;
   postedCents: number | null;
+  note: string | null;
 }
 
 const LABEL: Record<LessonStatus, string> = {
@@ -95,49 +97,59 @@ export function AttendanceRegister({
         <div className="mt-3 overflow-hidden rounded-2xl border border-brand-mist bg-white">
           <ul className="divide-y divide-brand-mist">
             {students.map((s) => (
-              <li
-                key={s.id}
-                className="flex flex-col gap-3 px-5 py-4 sm:flex-row sm:items-center sm:justify-between"
-              >
-                <div className="min-w-0">
-                  <p className="font-medium text-brand-plum">{s.name}</p>
-                  <p className="mt-0.5 text-xs text-brand-ink/55">
-                    Rate {s.rateCents ? formatMoney(s.rateCents) : "— not set"}
-                    {s.status !== null
-                      ? ` · posted ${formatMoney(s.postedCents ?? 0)}`
-                      : ""}
-                  </p>
-                </div>
-                {s.rateCents === 0 ? (
-                  <Link
-                    href={`/dashboard/students/${s.id}`}
-                    className="rounded-lg bg-brand-gold/15 px-3 py-1.5 text-xs font-medium text-brand-plum hover:bg-brand-gold/25"
-                  >
-                    Set a rate to mark →
-                  </Link>
-                ) : (
-                  <div className="flex gap-1.5">
-                    {LESSON_STATUSES.map((st) => {
-                      const active = s.status === st.value;
-                      return (
-                        <button
-                          key={st.value}
-                          type="button"
-                          disabled={isPending}
-                          onClick={() => mark(s, st.value)}
-                          className={
-                            "rounded-lg px-3 py-1.5 text-xs font-medium transition-colors disabled:opacity-50 " +
-                            (active
-                              ? "bg-brand-plum text-brand-cream"
-                              : "border border-brand-mist text-brand-ink/70 hover:border-brand-plum/30 hover:bg-brand-plum/[0.04]")
-                          }
-                        >
-                          {st.label}
-                        </button>
-                      );
-                    })}
+              <li key={s.id} className="px-5 py-4">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="min-w-0">
+                    <p className="font-medium text-brand-plum">{s.name}</p>
+                    <p className="mt-0.5 text-xs text-brand-ink/55">
+                      Rate {s.rateCents ? formatMoney(s.rateCents) : "— not set"}
+                      {s.status !== null
+                        ? ` · posted ${formatMoney(s.postedCents ?? 0)}`
+                        : ""}
+                    </p>
                   </div>
-                )}
+                  {s.rateCents === 0 ? (
+                    <Link
+                      href={`/dashboard/students/${s.id}`}
+                      className="rounded-lg bg-brand-gold/15 px-3 py-1.5 text-xs font-medium text-brand-plum hover:bg-brand-gold/25"
+                    >
+                      Set a rate to mark →
+                    </Link>
+                  ) : (
+                    <div className="flex gap-1.5">
+                      {LESSON_STATUSES.map((st) => {
+                        const active = s.status === st.value;
+                        return (
+                          <button
+                            key={st.value}
+                            type="button"
+                            disabled={isPending}
+                            onClick={() => mark(s, st.value)}
+                            className={
+                              "rounded-lg px-3 py-1.5 text-xs font-medium transition-colors disabled:opacity-50 " +
+                              (active
+                                ? "bg-brand-plum text-brand-cream"
+                                : "border border-brand-mist text-brand-ink/70 hover:border-brand-plum/30 hover:bg-brand-plum/[0.04]")
+                            }
+                          >
+                            {st.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+
+                {/* "What we covered" — the fuel for the weekly parent note.
+                    Only when the student actually attended (present/late);
+                    there's nothing to cover on an absent/cancelled day. */}
+                {s.status === "present" || s.status === "late" ? (
+                  <LessonNote
+                    studentId={s.id}
+                    date={date}
+                    initial={s.note ?? ""}
+                  />
+                ) : null}
               </li>
             ))}
           </ul>
@@ -152,6 +164,51 @@ export function AttendanceRegister({
           </span>
         </span>
       </div>
+    </div>
+  );
+}
+
+/**
+ * One-line "what we covered" for a marked student. Saves on blur (and only when
+ * the text actually changed) so it never nags. This is the fuel the weekly parent
+ * note is written from — optional, ~5 seconds, internal (parents never see it raw).
+ */
+function LessonNote({
+  studentId,
+  date,
+  initial,
+}: {
+  studentId: string;
+  date: string;
+  initial: string;
+}) {
+  const [value, setValue] = useState(initial);
+  const [saved, setSaved] = useState(initial);
+  const [isPending, startTransition] = useTransition();
+
+  function save() {
+    if (value.trim() === saved.trim()) return;
+    startTransition(async () => {
+      const res = await setLessonNote(studentId, date, value);
+      if (res.ok) {
+        setSaved(value);
+        toast.success("Saved", { duration: 1200 });
+      } else {
+        toast.error("Couldn't save the note");
+      }
+    });
+  }
+
+  return (
+    <div className="mt-3">
+      <input
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        onBlur={save}
+        disabled={isPending}
+        placeholder="What we covered (optional) — feeds the weekly parent note"
+        className="block w-full rounded-lg border border-brand-mist bg-brand-cream/40 px-3 py-2 text-xs text-brand-ink/80 placeholder:text-brand-ink/40 focus:border-brand-plum/30 focus:bg-white focus:outline-none disabled:opacity-50"
+      />
     </div>
   );
 }

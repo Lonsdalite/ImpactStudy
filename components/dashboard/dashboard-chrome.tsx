@@ -4,18 +4,30 @@ import Image from "next/image";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
-const NAV: { href: string; label: string; staffOnly?: boolean }[] = [
+const NAV: {
+  href: string;
+  label: string;
+  parentLabel?: string;
+  staffOnly?: boolean;
+}[] = [
   { href: "/dashboard", label: "Overview" },
-  { href: "/dashboard/students", label: "Students" },
+  { href: "/dashboard/students", label: "Students", parentLabel: "Children" },
   { href: "/dashboard/attendance", label: "Attendance", staffOnly: true },
   { href: "/dashboard/billing", label: "Billing", staffOnly: true },
   { href: "/dashboard/practice", label: "Practice" },
   { href: "/dashboard/voice", label: "Voice", staffOnly: true },
-  { href: "/dashboard/reports", label: "Reports" },
+  { href: "/dashboard/reports", label: "Reports", parentLabel: "Progress" },
 ];
 
+// The product/brand name. Shown once in the sidebar. For the pilot the tenant's
+// displayName is also "ImpactStudy", so we only surface the tenant name when it
+// actually differs (i.e. a future second tenant) to avoid showing it twice.
+const BRAND = "ImpactStudy";
+
+// Product-aligned role labels. The owner of a tutoring practice IS the tutor, so
+// we show "Tutor" rather than the technical "Owner".
 const ROLE_LABEL: Record<string, string> = {
-  owner: "Owner",
+  owner: "Tutor",
   admin: "Admin",
   tutor: "Tutor",
   parent: "Parent",
@@ -42,7 +54,10 @@ export function DashboardChrome({
   isStaff: boolean;
 }) {
   const pathname = usePathname();
-  const nav = NAV.filter((item) => !item.staffOnly || isStaff);
+  const nav = NAV.filter((item) => !item.staffOnly || isStaff).map((item) => ({
+    href: item.href,
+    label: !isStaff && item.parentLabel ? item.parentLabel : item.label,
+  }));
 
   return (
     <>
@@ -52,22 +67,19 @@ export function DashboardChrome({
           <Image
             src="/brand/seal.png"
             alt="ImpactStudy"
-            width={32}
-            height={32}
+            width={38}
+            height={38}
             className="select-none"
           />
-          <span className="font-display text-base text-brand-plum">
-            ImpactStudy
-          </span>
-        </div>
-
-        <div className="mx-5 mb-2 rounded-xl border border-brand-mist bg-white px-4 py-3">
-          <p className="truncate text-sm font-medium text-brand-plum">
-            {tenantName}
-          </p>
-          <p className="mt-0.5 text-xs text-brand-ink/55">
-            {ROLE_LABEL[role] ?? role}
-          </p>
+          <div className="min-w-0">
+            <span className="block font-display text-lg leading-tight text-brand-plum">
+              {BRAND}
+            </span>
+            <span className="block truncate text-xs text-brand-ink/55">
+              {ROLE_LABEL[role] ?? role}
+              {tenantName && tenantName !== BRAND ? ` · ${tenantName}` : ""}
+            </span>
+          </div>
         </div>
 
         <nav className="mt-2 flex flex-1 flex-col gap-0.5 px-3">
@@ -120,12 +132,12 @@ export function DashboardChrome({
             <Image
               src="/brand/seal.png"
               alt="ImpactStudy"
-              width={28}
-              height={28}
+              width={30}
+              height={30}
               className="select-none"
             />
             <span className="truncate text-sm font-medium text-brand-plum">
-              {tenantName}
+              {tenantName && tenantName !== BRAND ? tenantName : BRAND}
             </span>
           </div>
           <form action="/auth/sign-out" method="post">

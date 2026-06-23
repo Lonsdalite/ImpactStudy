@@ -378,6 +378,53 @@ create policy payments_delete_staff on public.payments
   using (public.is_tenant_staff(tenant_id));
 
 -- ----------------------------------------------------------------------------
+-- 11c. reports (parent heartbeat — weekly progress notes)
+-- ----------------------------------------------------------------------------
+-- Lifecycle draft -> approved -> sent. The trust rule (20_Product_UX_and_Moat.md
+-- §7.3): a parent may ONLY ever see a SENT note. Drafts AND internally-approved
+-- (reviewed but not yet delivered) notes stay tutor-only — "approve" is the
+-- tutor's sign-off, "send" is the deliberate hand-off to the parent. Enforced
+-- here, not just in the UI: a parent querying the table directly cannot read a
+-- draft or an approved-unsent note. Bulk drafting runs via Drizzle (service
+-- path, bypasses RLS, filters tenant_id in code); approve/edit/send run on the
+-- supabase-js staff path and exercise the write policies below.
+alter table public.reports enable row level security;
+
+grant select, insert, update, delete on public.reports to authenticated;
+
+drop policy if exists reports_select_staff_or_parent on public.reports;
+create policy reports_select_staff_or_parent on public.reports
+  for select to authenticated
+  using (
+    public.is_tenant_staff(tenant_id)
+    or (
+      status = 'sent'
+      and exists (
+        select 1
+        from public.student_parents sp
+        where sp.student_id = public.reports.student_id
+          and sp.parent_user_id = (select auth.uid())
+      )
+    )
+  );
+
+drop policy if exists reports_insert_staff on public.reports;
+create policy reports_insert_staff on public.reports
+  for insert to authenticated
+  with check (public.is_tenant_staff(tenant_id));
+
+drop policy if exists reports_update_staff on public.reports;
+create policy reports_update_staff on public.reports
+  for update to authenticated
+  using (public.is_tenant_staff(tenant_id))
+  with check (public.is_tenant_staff(tenant_id));
+
+drop policy if exists reports_delete_staff on public.reports;
+create policy reports_delete_staff on public.reports
+  for delete to authenticated
+  using (public.is_tenant_staff(tenant_id));
+
+-- ----------------------------------------------------------------------------
 -- 12. Tell PostgREST to reload its schema cache (so new grants/tables show up
 --     on the Data API immediately — Day 1 set "auto-expose new tables: OFF").
 -- ----------------------------------------------------------------------------

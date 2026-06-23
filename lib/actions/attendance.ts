@@ -89,6 +89,30 @@ export async function restoreLesson(
 }
 
 /**
+ * Capture the one-line "what we covered" against an existing lesson. This is the
+ * FUEL for the parent heartbeat (20_Product_UX_and_Moat.md §7.2): a 5-second note
+ * at the register that the weekly summary is written from. Updates the lesson's
+ * note in place; a lesson row must already exist (we only surface the input once
+ * the student is marked). RLS enforces staff-only writes.
+ */
+export async function setLessonNote(
+  studentId: string,
+  date: string,
+  note: string,
+): Promise<{ ok: boolean }> {
+  if (!studentId || !date) return { ok: false };
+  const supabase = await createClient();
+  const trimmed = note.trim();
+  const { error } = await supabase
+    .from("lessons")
+    .update({ note: trimmed.length > 0 ? trimmed : null })
+    .eq("student_id", studentId)
+    .eq("date", date);
+  revalidatePath("/dashboard", "layout");
+  return { ok: !error };
+}
+
+/**
  * Mark every still-unmarked active student present for `date` (the 80/20 flow:
  * most attend; mark the exceptions after). Leaves already-marked students alone
  * so it never clobbers an exception you've set.

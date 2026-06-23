@@ -1,14 +1,14 @@
 import { serve } from "inngest/next";
 import { inngest } from "@/lib/inngest/client";
+import { draftWeeklyReports } from "@/lib/inngest/functions/draft-weekly-reports";
 
 /**
  * Inngest webhook endpoint.
  *
  * The Inngest dashboard ingests this URL during deploy ("sync"). Each
- * registered function below becomes a triggerable job. Empty array today —
- * we add functions as features need them in Phase 1.
+ * registered function below becomes a triggerable job.
  */
-const functions: never[] = [];
+const functions = [draftWeeklyReports];
 
 export const { GET, POST, PUT } = serve({
   client: inngest,
