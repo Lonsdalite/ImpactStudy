@@ -120,7 +120,11 @@ async function main() {
   console.log(`Seeding with base inbox: ${BASE_EMAIL}`);
 
   // 1. Auth users (owner + 2 parents)
-  const ownerEmail = plus("fatima");
+  // For a real demo to Fatima, set FATIMA_OWNER_EMAIL to her actual address so
+  // the magic link lands in HER inbox (not your plus-addressed one). Parents
+  // stay on the base inbox so you can still log in as them to verify RLS. Note:
+  // this creates a NEW owner — the old plus-addressed owner row stays (harmless).
+  const ownerEmail = process.env.FATIMA_OWNER_EMAIL?.trim() || plus("fatima");
   const parent1Email = plus("parent1");
   const parent2Email = plus("parent2");
 
