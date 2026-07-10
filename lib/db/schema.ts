@@ -40,6 +40,13 @@ export const billingCycleEnum = pgEnum("billing_cycle", [
   "monthly",
 ]);
 
+// Delivery mode of an enrollment / price-list row. Group price is flat per
+// student (not a split); group size is not modelled yet (doc 26 §2, deferred).
+export const enrollmentModeEnum = pgEnum("enrollment_mode", [
+  "one_to_one",
+  "group",
+]);
+
 // ---------- tenants ----------
 // One tenant per tutoring practice. Fatima is tenant #1.
 export const tenants = pgTable("tenants", {
@@ -105,15 +112,9 @@ export const students = pgTable(
       .references(() => tenants.id, { onDelete: "cascade" }),
     firstName: text("first_name").notNull(),
     lastName: text("last_name"),
+    // The join key into the price catalog (price_list_items). e.g. 'Y6'.
     yearLevel: text("year_level"), // 'Y3', 'Y4', etc.
     active: boolean("active").default(true).notNull(),
-    // Default fee charged per attended lesson (attendance-driven billing).
-    // Nullable until a rate is assigned. onDelete set null so deleting a rate
-    // card doesn't cascade-delete students.
-    defaultRateCardId: uuid("default_rate_card_id").references(
-      () => rateCards.id,
-      { onDelete: "set null" },
-    ),
     // Billing cadence + the date cycles are counted from (their start/join
     // date). Together these let the app compute each student's current period
     // and next-due date — no two students need the same cycle.
@@ -148,6 +149,113 @@ export const studentParents = pgTable(
   (t) => [
     unique("student_parents_unique").on(t.studentId, t.parentUserId),
     index("student_parents_tenant_idx").on(t.tenantId),
+  ],
+);
+
+// ---------- subjects ----------
+// Tenant-scoped, extensible list of subjects Fatima teaches. Seed: English,
+// Physics, Chemistry, Maths. A subject is the "what" half of an enrollment and
+// the price-catalog key (doc 26 §2 / doc 27 §2.2).
+export const subjects = pgTable(
+  "subjects",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    name: text("name").notNull(), // "Maths"
+    active: boolean("active").default(true).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (t) => [
+    unique("subjects_tenant_name_unique").on(t.tenantId, t.name),
+    index("subjects_tenant_idx").on(t.tenantId),
+  ],
+);
+
+// ---------- price_list_items ----------
+// Fatima-editable catalog. One row per (year level × subject × mode) →
+// hourly rate + default session length. She adds a row when a new combo
+// appears; tenant #2 gets its own catalog (doc 26 §2 / doc 27 §2.2).
+//   e.g. Y6 Physics 1:1 → 6000c/hr, 60 min;  Y6 Maths group → 4000c/hr, 90 min
+export const priceListItems = pgTable(
+  "price_list_items",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    yearLevel: text("year_level").notNull(), // "Y6"
+    subjectId: uuid("subject_id")
+      .notNull()
+      .references(() => subjects.id, { onDelete: "cascade" }),
+    mode: enrollmentModeEnum("mode").notNull(),
+    hourlyRateCents: integer("hourly_rate_cents").notNull(), // 6000 = $60/hr
+    // Mode-based default set by the app (1:1→60, group→90), NOT hardcoded here —
+    // a value so other tenants and one-off long classes need no code change.
+    defaultSessionMinutes: integer("default_session_minutes").notNull(),
+    currency: text("currency").default("AUD").notNull(),
+    active: boolean("active").default(true).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (t) => [
+    unique("price_list_items_unique").on(
+      t.tenantId,
+      t.yearLevel,
+      t.subjectId,
+      t.mode,
+    ),
+    index("price_list_items_tenant_idx").on(t.tenantId),
+    index("price_list_items_subject_idx").on(t.subjectId),
+  ],
+);
+
+// ---------- enrollments ----------
+// The unit of everything (doc 26 §0/§2). student × subject × mode, inheriting
+// hourly rate (via the resolved price_list_item) + session length. Its schedule
+// (Bucket B) and assignments (Bucket C) hang off this row.
+export const enrollments = pgTable(
+  "enrollments",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    studentId: uuid("student_id")
+      .notNull()
+      .references(() => students.id, { onDelete: "cascade" }),
+    subjectId: uuid("subject_id")
+      .notNull()
+      .references(() => subjects.id, { onDelete: "cascade" }),
+    mode: enrollmentModeEnum("mode").notNull(),
+    // Resolved at creation from (student.year_level, subject, mode). Nullable so
+    // deleting a catalog row doesn't cascade-delete the enrollment; the billed
+    // rate is snapshotted onto each lesson anyway.
+    priceListItemId: uuid("price_list_item_id").references(
+      () => priceListItems.id,
+      { onDelete: "set null" },
+    ),
+    // Snapshot of the hourly rate at enrollment time — survives a catalog edit.
+    hourlyRateCents: integer("hourly_rate_cents").notNull(),
+    currency: text("currency").default("AUD").notNull(),
+    // Inherited default block length; a per-slot / long-class override lives on
+    // the lesson (duration_minutes).
+    sessionMinutes: integer("session_minutes").notNull(),
+    active: boolean("active").default(true).notNull(),
+    startDate: date("start_date"), // 'YYYY-MM-DD'; null = from created_at
+    endDate: date("end_date"), // null = ongoing
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (t) => [
+    index("enrollments_tenant_idx").on(t.tenantId),
+    index("enrollments_student_idx").on(t.studentId),
+    index("enrollments_subject_idx").on(t.subjectId),
   ],
 );
 
@@ -220,36 +328,17 @@ export const tenantCorpusSubscriptions = pgTable(
   ],
 );
 
-// ---------- rate_cards ----------
-// A named fee (per attended lesson). Per-student rate lives on
-// students.default_rate_card_id. Reusable so the same fee can apply to many
-// students and so the SaaS can offer tiered rates later. Amount in cents to
-// avoid float money bugs.
-export const rateCards = pgTable(
-  "rate_cards",
-  {
-    id: uuid("id").primaryKey().defaultRandom(),
-    tenantId: uuid("tenant_id")
-      .notNull()
-      .references(() => tenants.id, { onDelete: "cascade" }),
-    name: text("name").notNull(), // "Standard 1:1", "Sibling rate"
-    amountCents: integer("amount_cents").notNull(), // e.g. 8000 = AUD 80.00
-    currency: text("currency").default("AUD").notNull(),
-    active: boolean("active").default(true).notNull(),
-    createdAt: timestamp("created_at", { withTimezone: true })
-      .defaultNow()
-      .notNull(),
-  },
-  (t) => [index("rate_cards_tenant_idx").on(t.tenantId)],
-);
-
 // ---------- lessons ----------
-// One row = one student's session on one date. Doubles as BOTH the attendance
-// register AND the billing ledger line (attendance IS billing — her #1 pain).
-// amount_cents is the fee posted for this lesson, snapshotted at mark time:
-//   present  -> full rate, late -> full rate (configurable later),
-//   absent   -> 0,        cancelled -> 0 (tutor-cancelled, no charge).
-// Monthly statement = sum(amount_cents) per student per month.
+// One row = one attended block against an ENROLLMENT on one date. Doubles as
+// BOTH the attendance register AND the billing ledger line (attendance IS
+// billing — her #1 pain). amount_cents is the fee posted for this lesson,
+// snapshotted at mark time as round(duration_minutes / 60 × enrollment rate):
+//   present  -> hours × rate, late -> hours × rate (configurable later),
+//   absent   -> 0,            cancelled -> 0 (tutor-cancelled, no charge).
+// A student's invoice for a cycle = sum(amount_cents) across ALL their
+// enrollments' lessons in that cycle. Multiple lessons per student per day are
+// allowed (different enrollments, or a double session); the one-per-enrollment-
+// per-day convention is enforced in app code, not the DB (doc 27 §2.3).
 export const lessonStatusEnum = pgEnum("lesson_status", [
   "present",
   "absent",
@@ -267,25 +356,29 @@ export const lessons = pgTable(
     studentId: uuid("student_id")
       .notNull()
       .references(() => students.id, { onDelete: "cascade" }),
+    // The enrollment this block belongs to (rate + subject resolve via it).
+    // Nullable only to survive a legacy/bare one-off; normal marks always set it.
+    enrollmentId: uuid("enrollment_id").references(() => enrollments.id, {
+      onDelete: "cascade",
+    }),
     date: date("date").notNull(), // 'YYYY-MM-DD' (the lesson day)
     status: lessonStatusEnum("status").notNull(),
+    // The block billed, in minutes. Defaults from the enrollment's
+    // session_minutes; overridable for a long / double class.
+    durationMinutes: integer("duration_minutes").default(0).notNull(),
     amountCents: integer("amount_cents").default(0).notNull(),
-    // Which rate produced amount_cents (snapshot; nullable so history survives
-    // a rate-card delete).
-    rateCardId: uuid("rate_card_id").references(() => rateCards.id, {
-      onDelete: "set null",
-    }),
     note: text("note"),
     createdAt: timestamp("created_at", { withTimezone: true })
       .defaultNow()
       .notNull(),
   },
   (t) => [
-    // One lesson per student per day (demo assumption; lets marking be an
-    // idempotent upsert).
-    unique("lessons_student_date_unique").on(t.studentId, t.date),
+    // No unique(student_id, date): a student may have several lessons a day
+    // (different enrollments or a double session). One-per-enrollment-per-day is
+    // a code convention (doc 27 §2.3); firm occurrence identity arrives in B.
     index("lessons_tenant_idx").on(t.tenantId),
     index("lessons_student_idx").on(t.studentId),
+    index("lessons_enrollment_idx").on(t.enrollmentId),
     index("lessons_date_idx").on(t.date),
   ],
 );
@@ -387,12 +480,58 @@ export const reports = pgTable(
 export const tenantsRelations = relations(tenants, ({ many }) => ({
   memberships: many(memberships),
   students: many(students),
+  subjects: many(subjects),
+  priceListItems: many(priceListItems),
+  enrollments: many(enrollments),
   corpusSources: many(corpusSources),
   corpusSubscriptions: many(tenantCorpusSubscriptions),
-  rateCards: many(rateCards),
   lessons: many(lessons),
   payments: many(payments),
   reports: many(reports),
+}));
+
+export const subjectsRelations = relations(subjects, ({ one, many }) => ({
+  tenant: one(tenants, {
+    fields: [subjects.tenantId],
+    references: [tenants.id],
+  }),
+  priceListItems: many(priceListItems),
+  enrollments: many(enrollments),
+}));
+
+export const priceListItemsRelations = relations(
+  priceListItems,
+  ({ one, many }) => ({
+    tenant: one(tenants, {
+      fields: [priceListItems.tenantId],
+      references: [tenants.id],
+    }),
+    subject: one(subjects, {
+      fields: [priceListItems.subjectId],
+      references: [subjects.id],
+    }),
+    enrollments: many(enrollments),
+  }),
+);
+
+export const enrollmentsRelations = relations(enrollments, ({ one, many }) => ({
+  tenant: one(tenants, {
+    fields: [enrollments.tenantId],
+    references: [tenants.id],
+  }),
+  student: one(students, {
+    fields: [enrollments.studentId],
+    references: [students.id],
+  }),
+  subject: one(subjects, {
+    fields: [enrollments.subjectId],
+    references: [subjects.id],
+  }),
+  priceListItem: one(priceListItems, {
+    fields: [enrollments.priceListItemId],
+    references: [priceListItems.id],
+  }),
+  lessons: many(lessons),
 }));
 
 export const corpusSourcesRelations = relations(
@@ -443,13 +582,10 @@ export const studentsRelations = relations(students, ({ one, many }) => ({
     references: [tenants.id],
   }),
   parentLinks: many(studentParents),
+  enrollments: many(enrollments),
   lessons: many(lessons),
   payments: many(payments),
   reports: many(reports),
-  defaultRateCard: one(rateCards, {
-    fields: [students.defaultRateCardId],
-    references: [rateCards.id],
-  }),
 }));
 
 export const paymentsRelations = relations(payments, ({ one }) => ({
@@ -463,15 +599,6 @@ export const paymentsRelations = relations(payments, ({ one }) => ({
   }),
 }));
 
-export const rateCardsRelations = relations(rateCards, ({ one, many }) => ({
-  tenant: one(tenants, {
-    fields: [rateCards.tenantId],
-    references: [tenants.id],
-  }),
-  students: many(students),
-  lessons: many(lessons),
-}));
-
 export const lessonsRelations = relations(lessons, ({ one }) => ({
   tenant: one(tenants, {
     fields: [lessons.tenantId],
@@ -481,9 +608,9 @@ export const lessonsRelations = relations(lessons, ({ one }) => ({
     fields: [lessons.studentId],
     references: [students.id],
   }),
-  rateCard: one(rateCards, {
-    fields: [lessons.rateCardId],
-    references: [rateCards.id],
+  enrollment: one(enrollments, {
+    fields: [lessons.enrollmentId],
+    references: [enrollments.id],
   }),
 }));
 
@@ -528,14 +655,19 @@ export type Student = typeof students.$inferSelect;
 export type NewStudent = typeof students.$inferInsert;
 export type StudentParent = typeof studentParents.$inferSelect;
 export type NewStudentParent = typeof studentParents.$inferInsert;
+export type Subject = typeof subjects.$inferSelect;
+export type NewSubject = typeof subjects.$inferInsert;
+export type PriceListItem = typeof priceListItems.$inferSelect;
+export type NewPriceListItem = typeof priceListItems.$inferInsert;
+export type Enrollment = typeof enrollments.$inferSelect;
+export type NewEnrollment = typeof enrollments.$inferInsert;
+export type EnrollmentMode = (typeof enrollmentModeEnum.enumValues)[number];
 export type CorpusSource = typeof corpusSources.$inferSelect;
 export type NewCorpusSource = typeof corpusSources.$inferInsert;
 export type TenantCorpusSubscription =
   typeof tenantCorpusSubscriptions.$inferSelect;
 export type NewTenantCorpusSubscription =
   typeof tenantCorpusSubscriptions.$inferInsert;
-export type RateCard = typeof rateCards.$inferSelect;
-export type NewRateCard = typeof rateCards.$inferInsert;
 export type Lesson = typeof lessons.$inferSelect;
 export type NewLesson = typeof lessons.$inferInsert;
 export type LessonStatus = (typeof lessonStatusEnum.enumValues)[number];

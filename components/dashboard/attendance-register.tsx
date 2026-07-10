@@ -4,22 +4,48 @@ import { useState, useTransition } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
-import { formatMoney, LESSON_STATUSES } from "@/lib/billing";
 import {
+  LESSON_STATUSES,
+  blockAmountCents,
+  formatDuration,
+  formatMoney,
+  modeLabel,
+} from "@/lib/billing";
+import {
+  addSession,
+  deleteLesson,
+  deleteLessons,
   markAllPresent,
   markAttendance,
   restoreLesson,
   setLessonNote,
 } from "@/lib/actions/attendance";
-import type { LessonStatus } from "@/lib/db/schema";
+import type { EnrollmentMode, LessonStatus } from "@/lib/db/schema";
 
-export interface RegisterStudent {
-  id: string;
-  name: string;
-  rateCents: number;
-  status: LessonStatus | null;
-  postedCents: number | null;
-  note: string | null;
+export interface RegisterLesson {
+  lessonId: string;
+  status: LessonStatus;
+  amountCents: number;
+  durationMinutes: number;
+  note?: string | null;
+}
+
+export interface RegisterEnrollment {
+  enrollmentId: string;
+  studentId: string;
+  studentName: string;
+  subjectName: string;
+  mode: EnrollmentMode;
+  hourlyRateCents: number;
+  sessionMinutes: number;
+  currency: string;
+  canonical: RegisterLesson | null;
+  extras: RegisterLesson[];
+}
+
+export interface RegisterGuard {
+  studentId: string;
+  studentName: string;
 }
 
 const LABEL: Record<LessonStatus, string> = {
@@ -29,32 +55,44 @@ const LABEL: Record<LessonStatus, string> = {
   cancelled: "Cancelled",
 };
 
+const ATTENDED = (s: LessonStatus) => s === "present" || s === "late";
+
 export function AttendanceRegister({
   date,
-  students,
+  enrollments,
+  guards,
 }: {
   date: string;
-  students: RegisterStudent[];
+  enrollments: RegisterEnrollment[];
+  guards: RegisterGuard[];
 }) {
   const router = useRouter();
   const [isPending, startTransition] = useTransition();
 
-  const markedCount = students.filter((s) => s.status !== null).length;
-  const dayTotal = students.reduce((sum, s) => sum + (s.postedCents ?? 0), 0);
+  const markedCount = enrollments.filter((e) => e.canonical !== null).length;
+  const dayTotal = enrollments.reduce(
+    (sum, e) =>
+      sum +
+      (e.canonical?.amountCents ?? 0) +
+      e.extras.reduce((s, x) => s + x.amountCents, 0),
+    0,
+  );
 
-  function mark(s: RegisterStudent, status: LessonStatus) {
+  function mark(e: RegisterEnrollment, status: LessonStatus) {
     startTransition(async () => {
-      const res = await markAttendance(s.id, date, status);
-      if (!res.ok) {
+      const res = await markAttendance(e.enrollmentId, date, status);
+      if (!res.ok || !res.lessonId) {
         toast.error("Couldn't save — try again");
         return;
       }
-      toast.success(`${s.name} — ${LABEL[status]}`, {
+      const lessonId = res.lessonId;
+      const prev = res.prev;
+      toast.success(`${e.studentName} · ${e.subjectName} — ${LABEL[status]}`, {
         action: {
           label: "Undo",
           onClick: () =>
             startTransition(async () => {
-              await restoreLesson(s.id, date, res.prev);
+              await restoreLesson(lessonId, prev);
               router.refresh();
             }),
         },
@@ -63,14 +101,54 @@ export function AttendanceRegister({
     });
   }
 
+  function addAnother(e: RegisterEnrollment) {
+    startTransition(async () => {
+      const res = await addSession(e.enrollmentId, date, "present");
+      if (!res.ok || !res.lessonId) {
+        toast.error("Couldn't add a session");
+        return;
+      }
+      const lessonId = res.lessonId;
+      toast.success(`Added a session for ${e.studentName}`, {
+        action: {
+          label: "Undo",
+          onClick: () =>
+            startTransition(async () => {
+              await deleteLesson(lessonId);
+              router.refresh();
+            }),
+        },
+      });
+      router.refresh();
+    });
+  }
+
+  function removeExtra(lessonId: string) {
+    startTransition(async () => {
+      await deleteLesson(lessonId);
+      toast.success("Session removed");
+      router.refresh();
+    });
+  }
+
   function markAll() {
     startTransition(async () => {
       const res = await markAllPresent(date);
-      toast.success(
-        res.count > 0
-          ? `Marked ${res.count} present — adjust any exceptions below`
-          : "Everyone's already marked",
-      );
+      if (res.count > 0) {
+        const ids = res.lessonIds;
+        toast.success(`Marked ${res.count} present — adjust any exceptions`, {
+          action: {
+            label: "Undo all",
+            onClick: () =>
+              startTransition(async () => {
+                await deleteLessons(ids);
+                router.refresh();
+              }),
+          },
+        });
+      } else {
+        toast.success("Everyone's already marked");
+      }
       router.refresh();
     });
   }
@@ -81,50 +159,60 @@ export function AttendanceRegister({
         <button
           type="button"
           onClick={markAll}
-          disabled={isPending}
+          disabled={isPending || enrollments.length === 0}
           className="rounded-lg bg-brand-sage/15 px-4 py-2 text-sm font-medium text-brand-plum transition-colors hover:bg-brand-sage/25 disabled:opacity-50"
         >
           Mark all present
         </button>
         <span className="text-xs text-brand-ink/55">
-          {markedCount} of {students.length} marked
+          {markedCount} of {enrollments.length} marked
         </span>
       </div>
 
-      {students.length === 0 ? (
-        <p className="mt-6 text-sm text-brand-ink/60">No active students yet.</p>
+      {enrollments.length === 0 && guards.length === 0 ? (
+        <p className="mt-6 text-sm text-brand-ink/60">
+          No active enrollments yet. Add an enrollment on a student to bill them.
+        </p>
       ) : (
         <div className="mt-3 overflow-hidden rounded-2xl border border-brand-mist bg-white">
           <ul className="divide-y divide-brand-mist">
-            {students.map((s) => (
-              <li key={s.id} className="px-5 py-4">
-                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                  <div className="min-w-0">
-                    <p className="font-medium text-brand-plum">{s.name}</p>
-                    <p className="mt-0.5 text-xs text-brand-ink/55">
-                      Rate {s.rateCents ? formatMoney(s.rateCents) : "— not set"}
-                      {s.status !== null
-                        ? ` · posted ${formatMoney(s.postedCents ?? 0)}`
-                        : ""}
-                    </p>
-                  </div>
-                  {s.rateCents === 0 ? (
-                    <Link
-                      href={`/dashboard/students/${s.id}`}
-                      className="rounded-lg bg-brand-gold/15 px-3 py-1.5 text-xs font-medium text-brand-plum hover:bg-brand-gold/25"
-                    >
-                      Set a rate to mark →
-                    </Link>
-                  ) : (
+            {enrollments.map((e) => {
+              const perSession = blockAmountCents(
+                e.sessionMinutes,
+                e.hourlyRateCents,
+              );
+              const status = e.canonical?.status ?? null;
+              return (
+                <li key={e.enrollmentId} className="px-5 py-4">
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div className="min-w-0">
+                      <p className="font-medium text-brand-plum">
+                        {e.studentName}
+                        <span className="ml-2 text-sm text-brand-ink/60">
+                          {e.subjectName}
+                        </span>
+                        <span className="ml-2 rounded-full bg-brand-sage/15 px-2 py-0.5 text-[11px] font-medium text-brand-plum">
+                          {modeLabel(e.mode)}
+                        </span>
+                      </p>
+                      <p className="mt-0.5 text-xs text-brand-ink/55">
+                        {formatMoney(e.hourlyRateCents, e.currency)}/hr ·{" "}
+                        {formatDuration(e.sessionMinutes)} →{" "}
+                        {formatMoney(perSession, e.currency)}
+                        {status !== null
+                          ? ` · posted ${formatMoney(e.canonical?.amountCents ?? 0, e.currency)}`
+                          : ""}
+                      </p>
+                    </div>
                     <div className="flex gap-1.5">
                       {LESSON_STATUSES.map((st) => {
-                        const active = s.status === st.value;
+                        const active = status === st.value;
                         return (
                           <button
                             key={st.value}
                             type="button"
                             disabled={isPending}
-                            onClick={() => mark(s, st.value)}
+                            onClick={() => mark(e, st.value)}
                             className={
                               "rounded-lg px-3 py-1.5 text-xs font-medium transition-colors disabled:opacity-50 " +
                               (active
@@ -137,19 +225,75 @@ export function AttendanceRegister({
                         );
                       })}
                     </div>
-                  )}
-                </div>
+                  </div>
 
-                {/* "What we covered" — the fuel for the weekly parent note.
-                    Only when the student actually attended (present/late);
-                    there's nothing to cover on an absent/cancelled day. */}
-                {s.status === "present" || s.status === "late" ? (
-                  <LessonNote
-                    studentId={s.id}
-                    date={date}
-                    initial={s.note ?? ""}
-                  />
-                ) : null}
+                  {/* Extra sessions (double / long class) */}
+                  {e.extras.length > 0 ? (
+                    <ul className="mt-3 flex flex-col gap-1.5">
+                      {e.extras.map((x) => (
+                        <li
+                          key={x.lessonId}
+                          className="flex items-center justify-between rounded-lg bg-brand-cream/40 px-3 py-1.5 text-xs text-brand-ink/70"
+                        >
+                          <span>
+                            Extra session · {formatDuration(x.durationMinutes)} ·{" "}
+                            {LABEL[x.status]} ·{" "}
+                            {formatMoney(x.amountCents, e.currency)}
+                          </span>
+                          <button
+                            type="button"
+                            disabled={isPending}
+                            onClick={() => removeExtra(x.lessonId)}
+                            className="text-brand-plum-mid hover:underline disabled:opacity-50"
+                          >
+                            Remove
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+
+                  {/* Attended → note + add-another-session */}
+                  {status !== null && ATTENDED(status) ? (
+                    <div className="mt-3 flex flex-col gap-2">
+                      {e.canonical ? (
+                        <LessonNote
+                          lessonId={e.canonical.lessonId}
+                          initial={e.canonical.note ?? ""}
+                        />
+                      ) : null}
+                      <button
+                        type="button"
+                        disabled={isPending}
+                        onClick={() => addAnother(e)}
+                        className="self-start rounded-lg border border-dashed border-brand-mist px-3 py-1.5 text-xs text-brand-plum-mid hover:border-brand-plum/30 hover:bg-brand-plum/[0.03] disabled:opacity-50"
+                      >
+                        + Add another session (double / long class)
+                      </button>
+                    </div>
+                  ) : null}
+                </li>
+              );
+            })}
+
+            {/* Guard rows — active students with no enrollment */}
+            {guards.map((g) => (
+              <li
+                key={g.studentId}
+                className="flex items-center justify-between px-5 py-4"
+              >
+                <div className="min-w-0">
+                  <p className="font-medium text-brand-plum">{g.studentName}</p>
+                  <p className="mt-0.5 text-xs text-brand-ink/55">
+                    No enrollment — nothing to bill yet
+                  </p>
+                </div>
+                <Link
+                  href={`/dashboard/students/${g.studentId}`}
+                  className="rounded-lg bg-brand-gold/15 px-3 py-1.5 text-xs font-medium text-brand-plum hover:bg-brand-gold/25"
+                >
+                  Add an enrollment →
+                </Link>
               </li>
             ))}
           </ul>
@@ -169,17 +313,14 @@ export function AttendanceRegister({
 }
 
 /**
- * One-line "what we covered" for a marked student. Saves on blur (and only when
- * the text actually changed) so it never nags. This is the fuel the weekly parent
- * note is written from — optional, ~5 seconds, internal (parents never see it raw).
+ * One-line "what we covered" for a marked lesson. Saves on blur (only when the
+ * text changed) so it never nags. Fuel for the weekly parent note.
  */
 function LessonNote({
-  studentId,
-  date,
+  lessonId,
   initial,
 }: {
-  studentId: string;
-  date: string;
+  lessonId: string;
   initial: string;
 }) {
   const [value, setValue] = useState(initial);
@@ -189,7 +330,7 @@ function LessonNote({
   function save() {
     if (value.trim() === saved.trim()) return;
     startTransition(async () => {
-      const res = await setLessonNote(studentId, date, value);
+      const res = await setLessonNote(lessonId, value);
       if (res.ok) {
         setSaved(value);
         toast.success("Saved", { duration: 1200 });
@@ -200,15 +341,13 @@ function LessonNote({
   }
 
   return (
-    <div className="mt-3">
-      <input
-        value={value}
-        onChange={(e) => setValue(e.target.value)}
-        onBlur={save}
-        disabled={isPending}
-        placeholder="What we covered (optional) — feeds the weekly parent note"
-        className="block w-full rounded-lg border border-brand-mist bg-brand-cream/40 px-3 py-2 text-xs text-brand-ink/80 placeholder:text-brand-ink/40 focus:border-brand-plum/30 focus:bg-white focus:outline-none disabled:opacity-50"
-      />
-    </div>
+    <input
+      value={value}
+      onChange={(e) => setValue(e.target.value)}
+      onBlur={save}
+      disabled={isPending}
+      placeholder="What we covered (optional) — feeds the weekly parent note"
+      className="block w-full rounded-lg border border-brand-mist bg-brand-cream/40 px-3 py-2 text-xs text-brand-ink/80 placeholder:text-brand-ink/40 focus:border-brand-plum/30 focus:bg-white focus:outline-none disabled:opacity-50"
+    />
   );
 }

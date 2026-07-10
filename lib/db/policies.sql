@@ -280,35 +280,101 @@ create policy tenant_corpus_sub_delete_staff on public.tenant_corpus_subscriptio
   using (public.is_tenant_staff(tenant_id));
 
 -- ----------------------------------------------------------------------------
--- 11. rate_cards + lessons (attendance/billing wedge)
+-- 10b. Enrollment substrate — subjects, price_list_items, enrollments
+--      (Slice A — doc 27). Replaces rate_cards. Staff write tenant-wide; any
+--      tenant member reads subjects + the price catalog; a parent reads their
+--      own child's enrollments for context (student role: none yet).
 -- ----------------------------------------------------------------------------
-alter table public.rate_cards enable row level security;
-alter table public.lessons    enable row level security;
+alter table public.subjects          enable row level security;
+alter table public.price_list_items  enable row level security;
+alter table public.enrollments       enable row level security;
 
-grant select, insert, update, delete on public.rate_cards to authenticated;
-grant select, insert, update, delete on public.lessons    to authenticated;
+grant select, insert, update, delete on public.subjects         to authenticated;
+grant select, insert, update, delete on public.price_list_items to authenticated;
+grant select, insert, update, delete on public.enrollments      to authenticated;
 
--- rate_cards: any tenant member may read; only staff may write.
-drop policy if exists rate_cards_select_member on public.rate_cards;
-create policy rate_cards_select_member on public.rate_cards
+-- subjects: members read their tenant's subjects; staff write.
+drop policy if exists subjects_select_member on public.subjects;
+create policy subjects_select_member on public.subjects
   for select to authenticated
   using (tenant_id in (select public.current_tenant_ids()));
 
-drop policy if exists rate_cards_insert_staff on public.rate_cards;
-create policy rate_cards_insert_staff on public.rate_cards
+drop policy if exists subjects_insert_staff on public.subjects;
+create policy subjects_insert_staff on public.subjects
   for insert to authenticated
   with check (public.is_tenant_staff(tenant_id));
 
-drop policy if exists rate_cards_update_staff on public.rate_cards;
-create policy rate_cards_update_staff on public.rate_cards
+drop policy if exists subjects_update_staff on public.subjects;
+create policy subjects_update_staff on public.subjects
   for update to authenticated
   using (public.is_tenant_staff(tenant_id))
   with check (public.is_tenant_staff(tenant_id));
 
-drop policy if exists rate_cards_delete_staff on public.rate_cards;
-create policy rate_cards_delete_staff on public.rate_cards
+drop policy if exists subjects_delete_staff on public.subjects;
+create policy subjects_delete_staff on public.subjects
   for delete to authenticated
   using (public.is_tenant_staff(tenant_id));
+
+-- price_list_items: members read their tenant's catalog; staff write.
+drop policy if exists price_list_items_select_member on public.price_list_items;
+create policy price_list_items_select_member on public.price_list_items
+  for select to authenticated
+  using (tenant_id in (select public.current_tenant_ids()));
+
+drop policy if exists price_list_items_insert_staff on public.price_list_items;
+create policy price_list_items_insert_staff on public.price_list_items
+  for insert to authenticated
+  with check (public.is_tenant_staff(tenant_id));
+
+drop policy if exists price_list_items_update_staff on public.price_list_items;
+create policy price_list_items_update_staff on public.price_list_items
+  for update to authenticated
+  using (public.is_tenant_staff(tenant_id))
+  with check (public.is_tenant_staff(tenant_id));
+
+drop policy if exists price_list_items_delete_staff on public.price_list_items;
+create policy price_list_items_delete_staff on public.price_list_items
+  for delete to authenticated
+  using (public.is_tenant_staff(tenant_id));
+
+-- enrollments: staff manage tenant-wide; a parent may READ (only) their own
+-- child's enrollments — the "what subjects is my kid on" context. No parent
+-- writes; no student access yet (Slice D adds the student role).
+drop policy if exists enrollments_select_staff_or_parent on public.enrollments;
+create policy enrollments_select_staff_or_parent on public.enrollments
+  for select to authenticated
+  using (
+    public.is_tenant_staff(tenant_id)
+    or exists (
+      select 1
+      from public.student_parents sp
+      where sp.student_id = public.enrollments.student_id
+        and sp.parent_user_id = (select auth.uid())
+    )
+  );
+
+drop policy if exists enrollments_insert_staff on public.enrollments;
+create policy enrollments_insert_staff on public.enrollments
+  for insert to authenticated
+  with check (public.is_tenant_staff(tenant_id));
+
+drop policy if exists enrollments_update_staff on public.enrollments;
+create policy enrollments_update_staff on public.enrollments
+  for update to authenticated
+  using (public.is_tenant_staff(tenant_id))
+  with check (public.is_tenant_staff(tenant_id));
+
+drop policy if exists enrollments_delete_staff on public.enrollments;
+create policy enrollments_delete_staff on public.enrollments
+  for delete to authenticated
+  using (public.is_tenant_staff(tenant_id));
+
+-- ----------------------------------------------------------------------------
+-- 11. lessons (attendance/billing wedge — now enrollment-scoped)
+-- ----------------------------------------------------------------------------
+alter table public.lessons enable row level security;
+
+grant select, insert, update, delete on public.lessons to authenticated;
 
 -- lessons: staff see/manage the whole tenant; a parent sees (read-only) the
 -- lessons of their own linked children (their attendance + fee feed).

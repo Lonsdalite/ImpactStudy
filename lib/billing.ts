@@ -1,28 +1,77 @@
-import type { BillingCycle, LessonStatus } from "@/lib/db/schema";
+import type {
+  BillingCycle,
+  EnrollmentMode,
+  LessonStatus,
+} from "@/lib/db/schema";
 
 /**
  * Attendance-driven billing helpers. Pure functions (no server-only) so both
  * server components and the client can format money consistently.
  *
- * Rule (PRD A2/A3): a lesson posts a fee snapshotted at mark time —
- *   present / late  -> full rate
+ * Slice A billing (doc 26 §2 / doc 27 §2.5): a lesson posts a fee snapshotted at
+ * mark time = round(duration_minutes / 60 × hourly_rate_cents), gated by status:
+ *   present / late     -> hours × rate
  *   absent / cancelled -> 0
  * "Late" charging full is a deliberate default; make it configurable later.
  */
-export function feeForStatus(
-  status: LessonStatus,
-  rateAmountCents: number,
+
+/** The dollars-in-cents value of a billed block: round(minutes/60 × hourlyRate). */
+export function blockAmountCents(
+  durationMinutes: number,
+  hourlyRateCents: number,
 ): number {
+  if (!Number.isFinite(durationMinutes) || !Number.isFinite(hourlyRateCents)) {
+    return 0;
+  }
+  return Math.round((durationMinutes / 60) * hourlyRateCents);
+}
+
+/**
+ * The fee posted for a lesson: the block value when the student showed up,
+ * zero when they didn't. `blockCents` = blockAmountCents(duration, rate).
+ */
+export function feeForStatus(status: LessonStatus, blockCents: number): number {
   switch (status) {
     case "present":
     case "late":
-      return rateAmountCents;
+      return blockCents;
     case "absent":
     case "cancelled":
       return 0;
     default:
       return 0;
   }
+}
+
+// ---------- enrollment mode + session length ----------
+
+const MODE_LABEL: Record<EnrollmentMode, string> = {
+  one_to_one: "1:1",
+  group: "Group",
+};
+export function modeLabel(mode: EnrollmentMode): string {
+  return MODE_LABEL[mode];
+}
+
+export const ENROLLMENT_MODES: { value: EnrollmentMode; label: string }[] = [
+  { value: "one_to_one", label: "1:1" },
+  { value: "group", label: "Group" },
+];
+
+/**
+ * The mode-based default session length (minutes): 1:1 → 60, group → 90. NOT
+ * hardcoded into the schema — it seeds the price-list row's editable value so
+ * other tenants and one-off long classes need no code change (doc 26 §2).
+ */
+export function defaultSessionMinutes(mode: EnrollmentMode): number {
+  return mode === "group" ? 90 : 60;
+}
+
+/** "1.5h" / "1h" / "45 min" from minutes, for compact rate lines. */
+export function formatDuration(minutes: number): string {
+  if (minutes % 60 === 0) return `${minutes / 60}h`;
+  if (minutes > 60) return `${(minutes / 60).toFixed(1)}h`;
+  return `${minutes} min`;
 }
 
 export function formatMoney(cents: number, currency = "AUD"): string {

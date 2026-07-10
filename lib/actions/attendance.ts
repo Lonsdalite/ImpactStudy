@@ -2,161 +2,307 @@
 
 import { revalidatePath } from "next/cache";
 import { createClient } from "@/lib/supabase/server";
-import { feeForStatus } from "@/lib/billing";
+import { blockAmountCents, feeForStatus } from "@/lib/billing";
 import type { LessonStatus } from "@/lib/db/schema";
 
 /**
- * Attendance write actions. Called imperatively from client components so we can
- * show toast confirmations + undo. Each returns enough to undo. RLS enforces
- * staff-only writes; we never trust a tenant_id from the client.
+ * Attendance write actions — now enrollment-scoped (Slice A). A lesson belongs to
+ * an ENROLLMENT (student × subject × mode), and its fee is
+ *   feeForStatus(status, round(duration_minutes / 60 × enrollment.hourly_rate_cents)).
+ *
+ * The DB no longer enforces one-lesson-per-student-per-day. The convention is
+ * one lesson per (enrollment, date) for the normal register mark; a double / long
+ * class inserts an extra row via addSession (doc 27 §2.3). Called imperatively
+ * from client components for toast-with-undo. RLS enforces staff-only writes; we
+ * never trust a tenant_id from the client.
  */
 
 const VALID: LessonStatus[] = ["present", "absent", "late", "cancelled"];
 
-interface StudentBilling {
+type SB = Awaited<ReturnType<typeof createClient>>;
+
+interface EnrollmentBilling {
   tenant_id: string;
-  default_rate_card_id: string | null;
-  rate: { amount_cents: number } | null;
+  student_id: string;
+  hourly_rate_cents: number;
+  session_minutes: number;
 }
 
-async function getBilling(
-  supabase: Awaited<ReturnType<typeof createClient>>,
-  studentId: string,
-): Promise<StudentBilling | null> {
+async function getEnrollmentBilling(
+  supabase: SB,
+  enrollmentId: string,
+): Promise<EnrollmentBilling | null> {
   const { data } = await supabase
-    .from("students")
-    .select("tenant_id, default_rate_card_id, rate:rate_cards(amount_cents)")
-    .eq("id", studentId)
+    .from("enrollments")
+    .select("tenant_id, student_id, hourly_rate_cents, session_minutes")
+    .eq("id", enrollmentId)
     .single();
-  return (data as unknown as StudentBilling) ?? null;
-}
-
-export async function markAttendance(
-  studentId: string,
-  date: string,
-  status: LessonStatus,
-): Promise<{ ok: boolean; prev: LessonStatus | null }> {
-  if (!studentId || !date || !VALID.includes(status)) {
-    return { ok: false, prev: null };
-  }
-  const supabase = await createClient();
-
-  const { data: existing } = await supabase
-    .from("lessons")
-    .select("status")
-    .eq("student_id", studentId)
-    .eq("date", date)
-    .maybeSingle();
-  const prev =
-    (existing as unknown as { status: LessonStatus } | null)?.status ?? null;
-
-  const billing = await getBilling(supabase, studentId);
-  if (!billing) return { ok: false, prev: null };
-
-  const { error } = await supabase.from("lessons").upsert(
-    {
-      tenant_id: billing.tenant_id,
-      student_id: studentId,
-      date,
-      status,
-      amount_cents: feeForStatus(status, billing.rate?.amount_cents ?? 0),
-      rate_card_id: billing.default_rate_card_id,
-    },
-    { onConflict: "student_id,date" },
-  );
-
-  revalidatePath("/dashboard", "layout");
-  return { ok: !error, prev };
-}
-
-/** Undo helper: restore a lesson to its previous status, or remove it. */
-export async function restoreLesson(
-  studentId: string,
-  date: string,
-  prev: LessonStatus | null,
-): Promise<{ ok: boolean }> {
-  if (prev === null) {
-    const supabase = await createClient();
-    const { error } = await supabase
-      .from("lessons")
-      .delete()
-      .eq("student_id", studentId)
-      .eq("date", date);
-    revalidatePath("/dashboard", "layout");
-    return { ok: !error };
-  }
-  return { ok: (await markAttendance(studentId, date, prev)).ok };
+  return (data as unknown as EnrollmentBilling) ?? null;
 }
 
 /**
- * Capture the one-line "what we covered" against an existing lesson. This is the
- * FUEL for the parent heartbeat (20_Product_UX_and_Moat.md §7.2): a 5-second note
- * at the register that the weekly summary is written from. Updates the lesson's
- * note in place; a lesson row must already exist (we only surface the input once
- * the student is marked). RLS enforces staff-only writes.
+ * Mark the canonical (one-per-enrollment-per-day) lesson for an enrollment.
+ * Updates the existing row for (enrollment, date) if there is one, else inserts.
+ * `durationOverride` (minutes) lets a single long class bill more than the
+ * enrollment default without adding a second session.
  */
-export async function setLessonNote(
-  studentId: string,
+export async function markAttendance(
+  enrollmentId: string,
   date: string,
-  note: string,
-): Promise<{ ok: boolean }> {
-  if (!studentId || !date) return { ok: false };
+  status: LessonStatus,
+  durationOverride?: number,
+): Promise<{ ok: boolean; lessonId: string | null; prev: LessonStatus | null }> {
+  if (!enrollmentId || !date || !VALID.includes(status)) {
+    return { ok: false, lessonId: null, prev: null };
+  }
   const supabase = await createClient();
-  const trimmed = note.trim();
-  const { error } = await supabase
+
+  const billing = await getEnrollmentBilling(supabase, enrollmentId);
+  if (!billing) return { ok: false, lessonId: null, prev: null };
+
+  const duration =
+    Number.isFinite(durationOverride) && (durationOverride as number) > 0
+      ? Math.round(durationOverride as number)
+      : billing.session_minutes;
+  const amount = feeForStatus(
+    status,
+    blockAmountCents(duration, billing.hourly_rate_cents),
+  );
+
+  // Canonical existing row for this (enrollment, date) — the earliest one.
+  const { data: existing } = await supabase
     .from("lessons")
-    .update({ note: trimmed.length > 0 ? trimmed : null })
-    .eq("student_id", studentId)
-    .eq("date", date);
+    .select("id, status")
+    .eq("enrollment_id", enrollmentId)
+    .eq("date", date)
+    .order("created_at", { ascending: true })
+    .limit(1);
+  const current = (existing as unknown as { id: string; status: LessonStatus }[] | null)?.[0];
+  const prev = current?.status ?? null;
+
+  if (current) {
+    const { error } = await supabase
+      .from("lessons")
+      .update({ status, duration_minutes: duration, amount_cents: amount })
+      .eq("id", current.id);
+    revalidatePath("/dashboard", "layout");
+    return { ok: !error, lessonId: current.id, prev };
+  }
+
+  const { data: inserted, error } = await supabase
+    .from("lessons")
+    .insert({
+      tenant_id: billing.tenant_id,
+      student_id: billing.student_id,
+      enrollment_id: enrollmentId,
+      date,
+      status,
+      duration_minutes: duration,
+      amount_cents: amount,
+    })
+    .select("id")
+    .single();
+  revalidatePath("/dashboard", "layout");
+  return {
+    ok: !error,
+    lessonId: (inserted as unknown as { id: string } | null)?.id ?? null,
+    prev: null,
+  };
+}
+
+/**
+ * "Add another session" — the double / long-class escape (doc 27 §2.3). Always
+ * INSERTS a new lesson row for the enrollment on that date (never upserts), so a
+ * 2h block on a 1h enrollment bills as two sessions. Returns the new id to undo.
+ */
+export async function addSession(
+  enrollmentId: string,
+  date: string,
+  status: LessonStatus,
+  durationMinutes?: number,
+): Promise<{ ok: boolean; lessonId: string | null }> {
+  if (!enrollmentId || !date || !VALID.includes(status)) {
+    return { ok: false, lessonId: null };
+  }
+  const supabase = await createClient();
+  const billing = await getEnrollmentBilling(supabase, enrollmentId);
+  if (!billing) return { ok: false, lessonId: null };
+
+  const duration =
+    Number.isFinite(durationMinutes) && (durationMinutes as number) > 0
+      ? Math.round(durationMinutes as number)
+      : billing.session_minutes;
+  const amount = feeForStatus(
+    status,
+    blockAmountCents(duration, billing.hourly_rate_cents),
+  );
+
+  const { data: inserted, error } = await supabase
+    .from("lessons")
+    .insert({
+      tenant_id: billing.tenant_id,
+      student_id: billing.student_id,
+      enrollment_id: enrollmentId,
+      date,
+      status,
+      duration_minutes: duration,
+      amount_cents: amount,
+    })
+    .select("id")
+    .single();
+  revalidatePath("/dashboard", "layout");
+  return {
+    ok: !error,
+    lessonId: (inserted as unknown as { id: string } | null)?.id ?? null,
+  };
+}
+
+/** Delete one lesson row by id (undo for addSession / an extra session). */
+export async function deleteLesson(
+  lessonId: string,
+): Promise<{ ok: boolean }> {
+  if (!lessonId) return { ok: false };
+  const supabase = await createClient();
+  const { error } = await supabase.from("lessons").delete().eq("id", lessonId);
   revalidatePath("/dashboard", "layout");
   return { ok: !error };
 }
 
 /**
- * Mark every still-unmarked active student present for `date` (the 80/20 flow:
- * most attend; mark the exceptions after). Leaves already-marked students alone
- * so it never clobbers an exception you've set.
+ * Undo a mark: restore a lesson to its previous status (recomputing the fee from
+ * its own stored duration + enrollment rate), or delete it if it was freshly
+ * created (prev === null).
+ */
+export async function restoreLesson(
+  lessonId: string,
+  prev: LessonStatus | null,
+): Promise<{ ok: boolean }> {
+  if (!lessonId) return { ok: false };
+  const supabase = await createClient();
+
+  if (prev === null) {
+    const { error } = await supabase.from("lessons").delete().eq("id", lessonId);
+    revalidatePath("/dashboard", "layout");
+    return { ok: !error };
+  }
+
+  const { data } = await supabase
+    .from("lessons")
+    .select("duration_minutes, enrollment:enrollments(hourly_rate_cents)")
+    .eq("id", lessonId)
+    .single();
+  const row = data as unknown as {
+    duration_minutes: number;
+    enrollment: { hourly_rate_cents: number } | null;
+  } | null;
+  if (!row) return { ok: false };
+
+  const amount = feeForStatus(
+    prev,
+    blockAmountCents(row.duration_minutes, row.enrollment?.hourly_rate_cents ?? 0),
+  );
+  const { error } = await supabase
+    .from("lessons")
+    .update({ status: prev, amount_cents: amount })
+    .eq("id", lessonId);
+  revalidatePath("/dashboard", "layout");
+  return { ok: !error };
+}
+
+/**
+ * Capture the one-line "what we covered" against a lesson (the fuel for the
+ * weekly parent heartbeat, doc 20 §7.2). Keyed by lesson id now that a student
+ * can have several lessons a day. RLS enforces staff-only writes.
+ */
+export async function setLessonNote(
+  lessonId: string,
+  note: string,
+): Promise<{ ok: boolean }> {
+  if (!lessonId) return { ok: false };
+  const supabase = await createClient();
+  const trimmed = note.trim();
+  const { error } = await supabase
+    .from("lessons")
+    .update({ note: trimmed.length > 0 ? trimmed : null })
+    .eq("id", lessonId);
+  revalidatePath("/dashboard", "layout");
+  return { ok: !error };
+}
+
+/**
+ * Mark every active enrollment with NO lesson yet on `date` as present (the
+ * 80/20 flow: most attend; fix exceptions after). Skips enrollments already
+ * touched that day so it never clobbers an exception. Returns the created lesson
+ * ids for a single batch-undo.
  */
 export async function markAllPresent(
   date: string,
-): Promise<{ ok: boolean; count: number }> {
-  if (!date) return { ok: false, count: 0 };
+): Promise<{ ok: boolean; count: number; lessonIds: string[] }> {
+  if (!date) return { ok: false, count: 0, lessonIds: [] };
   const supabase = await createClient();
 
-  const [{ data: studentRows }, { data: lessonRows }] = await Promise.all([
+  const [{ data: enrollmentRows }, { data: lessonRows }] = await Promise.all([
     supabase
-      .from("students")
-      .select("id, tenant_id, default_rate_card_id, rate:rate_cards(amount_cents)")
+      .from("enrollments")
+      .select(
+        "id, tenant_id, student_id, hourly_rate_cents, session_minutes, student:students(active)",
+      )
       .eq("active", true),
-    supabase.from("lessons").select("student_id").eq("date", date),
+    supabase.from("lessons").select("enrollment_id").eq("date", date),
   ]);
 
-  const students = (studentRows ?? []) as unknown as ({ id: string } & StudentBilling)[];
-  const marked = new Set(
-    ((lessonRows ?? []) as unknown as { student_id: string }[]).map(
-      (l) => l.student_id,
-    ),
+  const enrollments = (enrollmentRows ?? []) as unknown as (EnrollmentBilling & {
+    id: string;
+    student: { active: boolean } | null;
+  })[];
+  const touched = new Set(
+    ((lessonRows ?? []) as unknown as { enrollment_id: string | null }[])
+      .map((l) => l.enrollment_id)
+      .filter((id): id is string => !!id),
   );
 
-  const toInsert = students
-    .filter((s) => !marked.has(s.id))
-    .map((s) => ({
-      tenant_id: s.tenant_id,
-      student_id: s.id,
+  const toInsert = enrollments
+    .filter((e) => e.student?.active !== false && !touched.has(e.id))
+    .map((e) => ({
+      tenant_id: e.tenant_id,
+      student_id: e.student_id,
+      enrollment_id: e.id,
       date,
       status: "present" as const,
-      amount_cents: feeForStatus("present", s.rate?.amount_cents ?? 0),
-      rate_card_id: s.default_rate_card_id,
+      duration_minutes: e.session_minutes,
+      amount_cents: feeForStatus(
+        "present",
+        blockAmountCents(e.session_minutes, e.hourly_rate_cents),
+      ),
     }));
 
-  let count = 0;
+  let lessonIds: string[] = [];
   if (toInsert.length > 0) {
-    const { error } = await supabase
+    const { data: inserted, error } = await supabase
       .from("lessons")
-      .upsert(toInsert, { onConflict: "student_id,date" });
-    if (!error) count = toInsert.length;
+      .insert(toInsert)
+      .select("id");
+    if (!error) {
+      lessonIds = ((inserted ?? []) as unknown as { id: string }[]).map(
+        (r) => r.id,
+      );
+    }
   }
 
   revalidatePath("/dashboard", "layout");
-  return { ok: true, count };
+  return { ok: true, count: lessonIds.length, lessonIds };
+}
+
+/** Batch undo for markAllPresent — delete every lesson it created. */
+export async function deleteLessons(
+  lessonIds: string[],
+): Promise<{ ok: boolean }> {
+  if (!lessonIds || lessonIds.length === 0) return { ok: true };
+  const supabase = await createClient();
+  const { error } = await supabase
+    .from("lessons")
+    .delete()
+    .in("id", lessonIds);
+  revalidatePath("/dashboard", "layout");
+  return { ok: !error };
 }

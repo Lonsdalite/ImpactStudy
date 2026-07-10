@@ -14,7 +14,6 @@ export function AddStudentForm({ today }: { today: string }) {
   const [firstName, setFirstName] = useState("");
   const [lastName, setLastName] = useState("");
   const [yearLevel, setYearLevel] = useState("");
-  const [rate, setRate] = useState("");
   const [cycle, setCycle] = useState<BillingCycle>("weekly");
   const [anchor, setAnchor] = useState(today);
 
@@ -22,7 +21,6 @@ export function AddStudentForm({ today }: { today: string }) {
     setFirstName("");
     setLastName("");
     setYearLevel("");
-    setRate("");
     setCycle("weekly");
     setAnchor(today);
   }
@@ -38,12 +36,11 @@ export function AddStudentForm({ today }: { today: string }) {
         firstName,
         lastName,
         yearLevel,
-        rateDollars: parseFloat(rate),
         cycle,
         anchor,
       });
       if (res.ok) {
-        toast.success(`Added ${firstName.trim()}`);
+        toast.success(`Added ${firstName.trim()} — add an enrollment to bill`);
         reset();
         setOpen(false);
         router.refresh();
@@ -96,21 +93,6 @@ export function AddStudentForm({ today }: { today: string }) {
             placeholder="Y6"
             className="mt-1 block w-20 rounded-lg border border-brand-mist px-2 py-1.5 text-sm text-brand-plum focus:outline-none"
           />
-        </label>
-        <label className="text-xs text-brand-ink/60">
-          Rate per lesson
-          <div className="mt-1 flex items-center rounded-lg border border-brand-mist px-2">
-            <span className="text-sm text-brand-ink/50">$</span>
-            <input
-              type="number"
-              step="1"
-              min="0"
-              value={rate}
-              onChange={(e) => setRate(e.target.value)}
-              placeholder="80"
-              className="w-20 bg-transparent px-1 py-1.5 text-sm text-brand-plum focus:outline-none"
-            />
-          </div>
         </label>
         <label className="text-xs text-brand-ink/60">
           Cycle

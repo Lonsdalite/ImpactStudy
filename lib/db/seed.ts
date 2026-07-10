@@ -1,24 +1,23 @@
 /**
- * Seed Fatima's pilot tenant (Phase 0 Day 3).
+ * Seed Fatima's pilot tenant onto the Slice A schema (subjects → price catalog →
+ * enrollments → hours×rate lessons).
  *
  *   pnpm db:seed
  *
  * Idempotent — fixed UUIDs + upserts, safe to re-run. Creates:
  *   - 1 tenant (ImpactStudy, Fatima's brand)
  *   - 1 owner (Fatima) + 2 parents, as real Supabase Auth users
- *   - 4 students, 3 parent→student links (1 student intentionally unparented)
+ *   - 4 subjects (English, Physics, Chemistry, Maths)
+ *   - 6 price-list rows (year × subject × mode → hourly rate + session length)
+ *   - 4 students w/ year levels, 3 parent→student links (1 unparented)
+ *   - 6 enrollments (incl. a group + multi-enrollment student)
+ *   - ~5 weeks of twice-weekly lessons billed hours × rate
  *   - 3 platform_baseline corpus sources + 1 tenant_uploaded + 3 subscriptions
  *
  * TEST IDENTITIES use Gmail plus-addressing off ONE inbox (SEED_BASE_EMAIL) so
- * you can magic-link in as every role from your own inbox and verify RLS:
- *   owner   → base+fatima@...   sees ALL students
- *   parent1 → base+parent1@...  sees ONLY their 2 children
- *   parent2 → base+parent2@...  sees ONLY their 1 child
- * Swap in Fatima's real email before the actual demo.
+ * you can magic-link in as every role from your own inbox and verify RLS.
  *
- * Writes go via the SERVICE-ROLE key + Drizzle (both bypass RLS) — this is the
- * Phase 0 "no platform admin in schema yet" path. Does NOT import lib/db or
- * lib/env.server (their `server-only` guard throws outside the Next runtime).
+ * Writes go via the SERVICE-ROLE key + Drizzle (both bypass RLS).
  */
 import { config } from "dotenv";
 config({ path: ".env.local" });
@@ -49,6 +48,11 @@ function plus(label: string): string {
   return `${local}+${label}@${domain}`;
 }
 
+/** round(minutes/60 × hourly_rate_cents) — mirrors lib/billing blockAmountCents. */
+function blockCents(minutes: number, hourlyRateCents: number): number {
+  return Math.round((minutes / 60) * hourlyRateCents);
+}
+
 // ---------- fixed UUIDs (deterministic → idempotent) ----------
 const TENANT_ID = "a0000000-0000-4000-8000-000000000001";
 const ST = {
@@ -63,9 +67,27 @@ const CORP = {
   im: "a0000000-0000-4000-8000-000000000023",
   fatimaPdf: "a0000000-0000-4000-8000-000000000024",
 };
-const RATE = {
-  standard: "a0000000-0000-4000-8000-000000000031", // AUD 80 / lesson
-  higher: "a0000000-0000-4000-8000-000000000032", // AUD 95 / lesson
+const SUBJ = {
+  english: "a0000000-0000-4000-8000-000000000041",
+  physics: "a0000000-0000-4000-8000-000000000042",
+  chemistry: "a0000000-0000-4000-8000-000000000043",
+  maths: "a0000000-0000-4000-8000-000000000044",
+};
+const PRICE = {
+  y6PhysicsOneToOne: "a0000000-0000-4000-8000-000000000051", // $60/hr, 60 min
+  y6MathsGroup: "a0000000-0000-4000-8000-000000000052", // $40/hr, 90 min
+  y7MathsOneToOne: "a0000000-0000-4000-8000-000000000053", // $65/hr, 60 min
+  y5EnglishGroup: "a0000000-0000-4000-8000-000000000054", // $40/hr, 90 min
+  y8ChemistryOneToOne: "a0000000-0000-4000-8000-000000000055", // $75/hr, 60 min
+  y8MathsOneToOne: "a0000000-0000-4000-8000-000000000056", // $75/hr, 60 min
+};
+const ENR = {
+  amaraPhysics: "a0000000-0000-4000-8000-000000000061",
+  amaraMathsGroup: "a0000000-0000-4000-8000-000000000062",
+  bilalMaths: "a0000000-0000-4000-8000-000000000063",
+  chloeEnglish: "a0000000-0000-4000-8000-000000000064",
+  devChemistry: "a0000000-0000-4000-8000-000000000065",
+  devMaths: "a0000000-0000-4000-8000-000000000066",
 };
 
 // ---------- clients ----------
@@ -82,12 +104,11 @@ async function getOrCreateAuthUser(
 ): Promise<User> {
   const { data, error } = await admin.auth.admin.createUser({
     email,
-    email_confirm: true, // pre-confirmed so magic link works immediately
+    email_confirm: true,
     user_metadata: { display_name: displayName },
   });
   if (data?.user) return data.user;
 
-  // Already exists → page through and match by email.
   if (error && /registered|exists/i.test(error.message)) {
     for (let page = 1; ; page++) {
       const { data: list, error: listErr } =
@@ -104,8 +125,6 @@ async function getOrCreateAuthUser(
 }
 
 async function upsertUserRow(u: User, displayName: string) {
-  // The on_auth_user_created trigger normally does this; we upsert too so the
-  // seed is robust if a user predates the trigger.
   await db
     .insert(schema.users)
     .values({ id: u.id, email: u.email!, displayName })
@@ -120,10 +139,6 @@ async function main() {
   console.log(`Seeding with base inbox: ${BASE_EMAIL}`);
 
   // 1. Auth users (owner + 2 parents)
-  // For a real demo to Fatima, set FATIMA_OWNER_EMAIL to her actual address so
-  // the magic link lands in HER inbox (not your plus-addressed one). Parents
-  // stay on the base inbox so you can still log in as them to verify RLS. Note:
-  // this creates a NEW owner — the old plus-addressed owner row stays (harmless).
   const ownerEmail = process.env.FATIMA_OWNER_EMAIL?.trim() || plus("fatima");
   const parent1Email = plus("parent1");
   const parent2Email = plus("parent2");
@@ -165,42 +180,53 @@ async function main() {
     ])
     .onConflictDoNothing();
 
-  // 3b. Rate cards (must exist before students — students FK them)
+  // 4. Subjects
   await db
-    .insert(schema.rateCards)
+    .insert(schema.subjects)
     .values([
-      { id: RATE.standard, tenantId: TENANT_ID, name: "Standard 1:1", amountCents: 8000 },
-      { id: RATE.higher, tenantId: TENANT_ID, name: "Senior 1:1", amountCents: 9500 },
+      { id: SUBJ.english, tenantId: TENANT_ID, name: "English" },
+      { id: SUBJ.physics, tenantId: TENANT_ID, name: "Physics" },
+      { id: SUBJ.chemistry, tenantId: TENANT_ID, name: "Chemistry" },
+      { id: SUBJ.maths, tenantId: TENANT_ID, name: "Maths" },
     ])
     .onConflictDoUpdate({
-      target: schema.rateCards.id,
-      set: { name: schema.rateCards.name, amountCents: schema.rateCards.amountCents },
+      target: schema.subjects.id,
+      set: { name: schema.subjects.name, active: true },
     });
 
-  // 4. Students (4; one stays unparented to test the parent-scope boundary)
+  // 5. Price list (year × subject × mode → hourly rate + session length)
+  await db
+    .insert(schema.priceListItems)
+    .values([
+      { id: PRICE.y6PhysicsOneToOne, tenantId: TENANT_ID, yearLevel: "Y6", subjectId: SUBJ.physics, mode: "one_to_one", hourlyRateCents: 6000, defaultSessionMinutes: 60 },
+      { id: PRICE.y6MathsGroup, tenantId: TENANT_ID, yearLevel: "Y6", subjectId: SUBJ.maths, mode: "group", hourlyRateCents: 4000, defaultSessionMinutes: 90 },
+      { id: PRICE.y7MathsOneToOne, tenantId: TENANT_ID, yearLevel: "Y7", subjectId: SUBJ.maths, mode: "one_to_one", hourlyRateCents: 6500, defaultSessionMinutes: 60 },
+      { id: PRICE.y5EnglishGroup, tenantId: TENANT_ID, yearLevel: "Y5", subjectId: SUBJ.english, mode: "group", hourlyRateCents: 4000, defaultSessionMinutes: 90 },
+      { id: PRICE.y8ChemistryOneToOne, tenantId: TENANT_ID, yearLevel: "Y8", subjectId: SUBJ.chemistry, mode: "one_to_one", hourlyRateCents: 7500, defaultSessionMinutes: 60 },
+      { id: PRICE.y8MathsOneToOne, tenantId: TENANT_ID, yearLevel: "Y8", subjectId: SUBJ.maths, mode: "one_to_one", hourlyRateCents: 7500, defaultSessionMinutes: 60 },
+    ])
+    .onConflictDoUpdate({
+      target: schema.priceListItems.id,
+      set: {
+        hourlyRateCents: schema.priceListItems.hourlyRateCents,
+        defaultSessionMinutes: schema.priceListItems.defaultSessionMinutes,
+        active: true,
+      },
+    });
+
+  // 6. Students (4; one stays unparented to test the parent-scope boundary)
   await db
     .insert(schema.students)
     .values([
-      { id: ST.amara, tenantId: TENANT_ID, firstName: "Amara", lastName: "Khan", yearLevel: "Y6", defaultRateCardId: RATE.standard },
-      { id: ST.bilal, tenantId: TENANT_ID, firstName: "Bilal", lastName: "Ahmed", yearLevel: "Y7", defaultRateCardId: RATE.standard },
-      { id: ST.chloe, tenantId: TENANT_ID, firstName: "Chloe", lastName: "Nguyen", yearLevel: "Y5", defaultRateCardId: RATE.standard },
-      { id: ST.dev, tenantId: TENANT_ID, firstName: "Dev", lastName: "Patel", yearLevel: "Y8", defaultRateCardId: RATE.higher },
+      { id: ST.amara, tenantId: TENANT_ID, firstName: "Amara", lastName: "Khan", yearLevel: "Y6" },
+      { id: ST.bilal, tenantId: TENANT_ID, firstName: "Bilal", lastName: "Ahmed", yearLevel: "Y7" },
+      { id: ST.chloe, tenantId: TENANT_ID, firstName: "Chloe", lastName: "Nguyen", yearLevel: "Y5" },
+      { id: ST.dev, tenantId: TENANT_ID, firstName: "Dev", lastName: "Patel", yearLevel: "Y8" },
     ])
     .onConflictDoUpdate({
       target: schema.students.id,
-      set: { active: true },
+      set: { active: true, yearLevel: schema.students.yearLevel },
     });
-
-  // Ensure rates are set even for students seeded BEFORE the rate column
-  // existed (onConflictDoUpdate above only refreshes `active`).
-  await db
-    .update(schema.students)
-    .set({ defaultRateCardId: RATE.standard })
-    .where(inArray(schema.students.id, [ST.amara, ST.bilal, ST.chloe]));
-  await db
-    .update(schema.students)
-    .set({ defaultRateCardId: RATE.higher })
-    .where(eq(schema.students.id, ST.dev));
 
   // Per-student billing cycles (varied for the demo), anchored 5 weeks ago.
   const anchorDate = new Date();
@@ -219,7 +245,7 @@ async function main() {
     .set({ billingCycle: "monthly", billingAnchor: anchorIso })
     .where(eq(schema.students.id, ST.chloe));
 
-  // 5. Parent → student links (parent1: Amara+Bilal; parent2: Chloe; Dev: none)
+  // 7. Parent → student links (parent1: Amara+Bilal; parent2: Chloe; Dev: none)
   await db
     .insert(schema.studentParents)
     .values([
@@ -229,7 +255,41 @@ async function main() {
     ])
     .onConflictDoNothing();
 
-  // 6. Corpus sources — 3 platform_baseline (NULL tenant) + 1 tenant_uploaded
+  // 8. Enrollments (snapshot rate + session length from the matching price row)
+  const enrollmentDefs = [
+    { id: ENR.amaraPhysics, studentId: ST.amara, subjectId: SUBJ.physics, mode: "one_to_one" as const, priceId: PRICE.y6PhysicsOneToOne, rate: 6000, minutes: 60 },
+    { id: ENR.amaraMathsGroup, studentId: ST.amara, subjectId: SUBJ.maths, mode: "group" as const, priceId: PRICE.y6MathsGroup, rate: 4000, minutes: 90 },
+    { id: ENR.bilalMaths, studentId: ST.bilal, subjectId: SUBJ.maths, mode: "one_to_one" as const, priceId: PRICE.y7MathsOneToOne, rate: 6500, minutes: 60 },
+    { id: ENR.chloeEnglish, studentId: ST.chloe, subjectId: SUBJ.english, mode: "group" as const, priceId: PRICE.y5EnglishGroup, rate: 4000, minutes: 90 },
+    { id: ENR.devChemistry, studentId: ST.dev, subjectId: SUBJ.chemistry, mode: "one_to_one" as const, priceId: PRICE.y8ChemistryOneToOne, rate: 7500, minutes: 60 },
+    { id: ENR.devMaths, studentId: ST.dev, subjectId: SUBJ.maths, mode: "one_to_one" as const, priceId: PRICE.y8MathsOneToOne, rate: 7500, minutes: 60 },
+  ];
+  await db
+    .insert(schema.enrollments)
+    .values(
+      enrollmentDefs.map((e) => ({
+        id: e.id,
+        tenantId: TENANT_ID,
+        studentId: e.studentId,
+        subjectId: e.subjectId,
+        mode: e.mode,
+        priceListItemId: e.priceId,
+        hourlyRateCents: e.rate,
+        currency: "AUD",
+        sessionMinutes: e.minutes,
+        startDate: anchorIso,
+      })),
+    )
+    .onConflictDoUpdate({
+      target: schema.enrollments.id,
+      set: {
+        active: true,
+        hourlyRateCents: schema.enrollments.hourlyRateCents,
+        sessionMinutes: schema.enrollments.sessionMinutes,
+      },
+    });
+
+  // 9. Corpus sources — 3 platform_baseline (NULL tenant) + 1 tenant_uploaded
   await db
     .insert(schema.corpusSources)
     .values([
@@ -243,7 +303,7 @@ async function main() {
       set: { name: schema.corpusSources.name },
     });
 
-  // 7. Subscribe Fatima's tenant to the 3 baseline sources
+  // 10. Subscribe Fatima's tenant to the 3 baseline sources
   await db
     .insert(schema.tenantCorpusSubscriptions)
     .values([
@@ -253,15 +313,8 @@ async function main() {
     ])
     .onConflictDoNothing();
 
-  // 8. Lessons — ~5 weeks of twice-weekly attendance so billing has real
-  // numbers. Deterministic status pattern (mostly present, some absent/late).
-  const rateFor: Record<string, { cents: number; card: string }> = {
-    [ST.amara]: { cents: 8000, card: RATE.standard },
-    [ST.bilal]: { cents: 8000, card: RATE.standard },
-    [ST.chloe]: { cents: 8000, card: RATE.standard },
-    [ST.dev]: { cents: 9500, card: RATE.higher },
-  };
-  const studentIds = [ST.amara, ST.bilal, ST.chloe, ST.dev];
+  // 11. Lessons — ~5 weeks of twice-weekly attendance PER ENROLLMENT so billing
+  // has real hours×rate numbers. Deterministic status (mostly present).
   const today = new Date();
   const lessonRows: (typeof schema.lessons.$inferInsert)[] = [];
 
@@ -272,19 +325,19 @@ async function main() {
     if (dow !== 1 && dow !== 4) continue;
     const iso = d.toISOString().slice(0, 10);
 
-    studentIds.forEach((sid, si) => {
-      const { cents, card } = rateFor[sid];
-      const seed = (si + back) % 7;
+    enrollmentDefs.forEach((en, ei) => {
+      const seed = (ei + back) % 7;
       const status: "present" | "absent" | "late" =
         seed === 3 ? "absent" : seed === 5 ? "late" : "present";
-      const amountCents = status === "absent" ? 0 : cents;
+      const amount = status === "absent" ? 0 : blockCents(en.minutes, en.rate);
       lessonRows.push({
         tenantId: TENANT_ID,
-        studentId: sid,
+        studentId: en.studentId,
+        enrollmentId: en.id,
         date: iso,
         status,
-        amountCents,
-        rateCardId: card,
+        durationMinutes: en.minutes,
+        amountCents: amount,
       });
     });
   }
@@ -294,10 +347,10 @@ async function main() {
   console.log(`Inserted/kept ${lessonRows.length} lesson rows.`);
   console.log("\n✅ Seed complete.\n");
   console.log("Log in (magic link) to verify RLS:");
-  console.log(`  OWNER  ${ownerEmail}   → should see all 4 students`);
-  console.log(`  PARENT ${parent1Email} → should see Amara + Bilal only`);
-  console.log(`  PARENT ${parent2Email} → should see Chloe only`);
-  console.log("All three links arrive in the one base inbox.\n");
+  console.log(`  OWNER  ${ownerEmail}   → all 4 students, 6 enrollments`);
+  console.log(`  PARENT ${parent1Email} → Amara + Bilal only`);
+  console.log(`  PARENT ${parent2Email} → Chloe only`);
+  console.log("\nMath check: Amara Maths group 90min @ $40/hr = $60/session.\n");
 }
 
 main()

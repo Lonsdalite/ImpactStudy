@@ -5,33 +5,6 @@ import { createClient } from "@/lib/supabase/server";
 import { resolveActiveTenant } from "@/lib/tenant";
 import type { BillingCycle } from "@/lib/db/schema";
 
-type SB = Awaited<ReturnType<typeof createClient>>;
-
-async function findOrCreateRateCard(
-  supabase: SB,
-  tenantId: string,
-  amountCents: number,
-): Promise<string | null> {
-  const { data: existing } = await supabase
-    .from("rate_cards")
-    .select("id")
-    .eq("tenant_id", tenantId)
-    .eq("amount_cents", amountCents)
-    .limit(1);
-  const found = (existing as unknown as { id: string }[] | null)?.[0]?.id;
-  if (found) return found;
-  const { data: created } = await supabase
-    .from("rate_cards")
-    .insert({
-      tenant_id: tenantId,
-      name: `$${(amountCents / 100).toFixed(0)} / lesson`,
-      amount_cents: amountCents,
-    })
-    .select("id")
-    .single();
-  return (created as unknown as { id: string } | null)?.id ?? null;
-}
-
 async function requireStaff() {
   const res = await resolveActiveTenant();
   if (res.status !== "ok") return null;
@@ -39,11 +12,15 @@ async function requireStaff() {
   return res.tenant;
 }
 
+/**
+ * Create a student. Rate is no longer set here — it comes from the price list
+ * via enrollments (Slice A). Year level matters now: it's the catalog join key.
+ * After adding, staff add one or more enrollments on the student record.
+ */
 export async function createStudent(input: {
   firstName: string;
   lastName: string;
   yearLevel: string;
-  rateDollars: number;
   cycle: BillingCycle;
   anchor: string;
 }): Promise<{ ok: boolean; studentId: string | null }> {
@@ -60,15 +37,6 @@ export async function createStudent(input: {
     : "monthly";
 
   const supabase = await createClient();
-  let rateCardId: string | null = null;
-  if (Number.isFinite(input.rateDollars) && input.rateDollars > 0) {
-    rateCardId = await findOrCreateRateCard(
-      supabase,
-      tenant.tenantId,
-      Math.round(input.rateDollars * 100),
-    );
-  }
-
   const { data, error } = await supabase
     .from("students")
     .insert({
@@ -76,7 +44,6 @@ export async function createStudent(input: {
       first_name: firstName,
       last_name: input.lastName?.trim() || null,
       year_level: input.yearLevel?.trim() || null,
-      default_rate_card_id: rateCardId,
       billing_cycle: cycle,
       billing_anchor: input.anchor || null,
       active: true,
@@ -106,7 +73,7 @@ export async function setStudentActive(
   return { ok: !error };
 }
 
-/** Permanent delete — cascades lessons + payments. For genuine mistakes only. */
+/** Permanent delete — cascades enrollments, lessons + payments. Mistakes only. */
 export async function deleteStudent(
   studentId: string,
 ): Promise<{ ok: boolean }> {

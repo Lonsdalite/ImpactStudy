@@ -6,9 +6,10 @@ import { todaySydney } from "@/lib/billing";
 import { DatePicker } from "@/components/dashboard/date-picker";
 import {
   AttendanceRegister,
-  type RegisterStudent,
+  type RegisterEnrollment,
+  type RegisterGuard,
 } from "@/components/dashboard/attendance-register";
-import type { LessonStatus } from "@/lib/db/schema";
+import type { EnrollmentMode, LessonStatus } from "@/lib/db/schema";
 
 export const metadata = { title: "Attendance" };
 
@@ -16,13 +17,25 @@ interface StudentRow {
   id: string;
   first_name: string;
   last_name: string | null;
-  rate: { amount_cents: number } | null;
+}
+interface EnrollmentRow {
+  id: string;
+  student_id: string;
+  mode: EnrollmentMode;
+  hourly_rate_cents: number;
+  session_minutes: number;
+  currency: string;
+  student: { first_name: string; last_name: string | null; active: boolean } | null;
+  subject: { name: string } | null;
 }
 interface LessonRow {
-  student_id: string;
+  id: string;
+  enrollment_id: string | null;
   status: LessonStatus;
+  duration_minutes: number;
   amount_cents: number;
   note: string | null;
+  created_at: string;
 }
 
 function addDays(iso: string, n: number): string {
@@ -70,35 +83,98 @@ export default async function AttendancePage({
   const date = params.date ?? todaySydney();
 
   const supabase = await createClient();
-  const [{ data: studentData }, { data: lessonData }] = await Promise.all([
-    supabase
-      .from("students")
-      .select("id, first_name, last_name, rate:rate_cards(amount_cents)")
-      .eq("tenant_id", tenant.tenantId)
-      .eq("active", true)
-      .order("first_name", { ascending: true }),
-    supabase
-      .from("lessons")
-      .select("student_id, status, amount_cents, note")
-      .eq("tenant_id", tenant.tenantId)
-      .eq("date", date),
-  ]);
+  const [{ data: studentData }, { data: enrollmentData }, { data: lessonData }] =
+    await Promise.all([
+      supabase
+        .from("students")
+        .select("id, first_name, last_name")
+        .eq("tenant_id", tenant.tenantId)
+        .eq("active", true)
+        .order("first_name", { ascending: true }),
+      supabase
+        .from("enrollments")
+        .select(
+          "id, student_id, mode, hourly_rate_cents, session_minutes, currency, student:students(first_name, last_name, active), subject:subjects(name)",
+        )
+        .eq("tenant_id", tenant.tenantId)
+        .eq("active", true),
+      supabase
+        .from("lessons")
+        .select(
+          "id, enrollment_id, status, duration_minutes, amount_cents, note, created_at",
+        )
+        .eq("tenant_id", tenant.tenantId)
+        .eq("date", date),
+    ]);
 
-  const studentRows = (studentData ?? []) as unknown as StudentRow[];
+  const students = (studentData ?? []) as unknown as StudentRow[];
+  const enrollmentRows = (enrollmentData ?? []) as unknown as EnrollmentRow[];
   const lessons = (lessonData ?? []) as unknown as LessonRow[];
-  const byStudent = new Map(lessons.map((l) => [l.student_id, l]));
 
-  const students: RegisterStudent[] = studentRows.map((s) => {
-    const lesson = byStudent.get(s.id);
-    return {
-      id: s.id,
-      name: `${s.first_name}${s.last_name ? ` ${s.last_name}` : ""}`,
-      rateCents: s.rate?.amount_cents ?? 0,
-      status: lesson?.status ?? null,
-      postedCents: lesson?.amount_cents ?? null,
-      note: lesson?.note ?? null,
-    };
-  });
+  // Group the day's lessons by enrollment, oldest first (canonical = first).
+  const byEnrollment = new Map<string, LessonRow[]>();
+  for (const l of lessons) {
+    if (!l.enrollment_id) continue;
+    const arr = byEnrollment.get(l.enrollment_id) ?? [];
+    arr.push(l);
+    byEnrollment.set(l.enrollment_id, arr);
+  }
+  for (const arr of byEnrollment.values()) {
+    arr.sort((a, b) => (a.created_at < b.created_at ? -1 : 1));
+  }
+
+  const activeEnrollments = enrollmentRows.filter(
+    (e) => e.student?.active !== false,
+  );
+
+  const enrollments: RegisterEnrollment[] = activeEnrollments
+    .map((e) => {
+      const rows = byEnrollment.get(e.id) ?? [];
+      const [canonical, ...extras] = rows;
+      const student = e.student;
+      const name = student
+        ? `${student.first_name}${student.last_name ? ` ${student.last_name}` : ""}`
+        : "—";
+      return {
+        enrollmentId: e.id,
+        studentId: e.student_id,
+        studentName: name,
+        subjectName: e.subject?.name ?? "—",
+        mode: e.mode,
+        hourlyRateCents: e.hourly_rate_cents,
+        sessionMinutes: e.session_minutes,
+        currency: e.currency,
+        canonical: canonical
+          ? {
+              lessonId: canonical.id,
+              status: canonical.status,
+              amountCents: canonical.amount_cents,
+              durationMinutes: canonical.duration_minutes,
+              note: canonical.note,
+            }
+          : null,
+        extras: extras.map((x) => ({
+          lessonId: x.id,
+          status: x.status,
+          amountCents: x.amount_cents,
+          durationMinutes: x.duration_minutes,
+        })),
+      };
+    })
+    .sort((a, b) =>
+      a.studentName === b.studentName
+        ? a.subjectName.localeCompare(b.subjectName)
+        : a.studentName.localeCompare(b.studentName),
+    );
+
+  // Guard rows: active students with no active enrollment ("add an enrollment").
+  const enrolledStudentIds = new Set(activeEnrollments.map((e) => e.student_id));
+  const guards: RegisterGuard[] = students
+    .filter((s) => !enrolledStudentIds.has(s.id))
+    .map((s) => ({
+      studentId: s.id,
+      studentName: `${s.first_name}${s.last_name ? ` ${s.last_name}` : ""}`,
+    }));
 
   return (
     <main className="flex-1 px-6 py-10 md:px-10">
@@ -111,8 +187,7 @@ export default async function AttendancePage({
         </h1>
         <p className="mt-2 text-sm text-brand-ink/65">
           Mark all present, then fix the exceptions. Fees post automatically —
-          present and late charge the full rate, absent and cancelled charge
-          nothing.
+          attended hours × the hourly rate; absent and cancelled charge nothing.
         </p>
 
         {/* Date nav */}
@@ -147,7 +222,11 @@ export default async function AttendancePage({
           </Link>
         </div>
 
-        <AttendanceRegister date={date} students={students} />
+        <AttendanceRegister
+          date={date}
+          enrollments={enrollments}
+          guards={guards}
+        />
       </div>
     </main>
   );
