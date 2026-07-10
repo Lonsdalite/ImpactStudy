@@ -315,6 +315,14 @@ async function main() {
 
   // 11. Lessons — ~5 weeks of twice-weekly attendance PER ENROLLMENT so billing
   // has real hours×rate numbers. Deterministic status (mostly present).
+  //
+  // Clear this tenant's lessons FIRST. Two reasons: (1) pre-pivot lessons have no
+  // enrollment_id (they'd show as "Unassigned" and inflate balances), and (2)
+  // lessons no longer have a natural unique key (the unique(student_id,date) was
+  // relaxed in Slice A), so onConflictDoNothing can't dedupe — without this a
+  // re-seed would STACK duplicate rows every run. Idempotent by construction.
+  await db.delete(schema.lessons).where(eq(schema.lessons.tenantId, TENANT_ID));
+
   const today = new Date();
   const lessonRows: (typeof schema.lessons.$inferInsert)[] = [];
 

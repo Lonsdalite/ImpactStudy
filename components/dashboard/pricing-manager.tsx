@@ -116,21 +116,25 @@ export function PricingManager({
             <p className="text-xs text-brand-ink/55">No subjects yet.</p>
           ) : (
             subjects.map((s) => (
-              <button
+              <span
                 key={s.id}
-                type="button"
-                disabled={isPending}
-                onClick={() => toggleSubject(s.id, !s.active)}
-                title={s.active ? "Click to archive" : "Click to restore"}
                 className={
-                  "rounded-full px-3 py-1.5 text-xs font-medium transition-colors disabled:opacity-50 " +
+                  "inline-flex items-center gap-2 rounded-full py-1.5 pl-3 pr-2 text-xs font-medium " +
                   (s.active
-                    ? "bg-brand-sage/15 text-brand-plum hover:bg-brand-sage/25"
-                    : "border border-brand-mist text-brand-ink/40 line-through")
+                    ? "bg-brand-sage/15 text-brand-plum"
+                    : "border border-brand-mist text-brand-ink/40")
                 }
               >
-                {s.name}
-              </button>
+                <span className={s.active ? "" : "line-through"}>{s.name}</span>
+                <button
+                  type="button"
+                  disabled={isPending}
+                  onClick={() => toggleSubject(s.id, !s.active)}
+                  className="rounded-full px-1.5 text-[11px] text-brand-plum-mid hover:bg-white/60 hover:underline disabled:opacity-50"
+                >
+                  {s.active ? "Archive" : "Restore"}
+                </button>
+              </span>
             ))
           )}
         </div>
