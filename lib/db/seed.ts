@@ -29,6 +29,7 @@ import { createClient, type User } from "@supabase/supabase-js";
 import * as schema from "./schema";
 import { FATIMA_VOICE } from "../voice-types";
 import { tallyItems, type CorrectionItem, type SubmissionPage } from "../homework-types";
+import { sydneyWallToUtc } from "../calendar";
 
 // ---------- env ----------
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -81,6 +82,7 @@ const PRICE = {
   y5EnglishGroup: "a0000000-0000-4000-8000-000000000054", // $40/hr, 90 min
   y8ChemistryOneToOne: "a0000000-0000-4000-8000-000000000055", // $75/hr, 60 min
   y8MathsOneToOne: "a0000000-0000-4000-8000-000000000056", // $75/hr, 60 min
+  y5MathsGroup: "a0000000-0000-4000-8000-000000000057", // $40/hr, 90 min (cluster demo)
 };
 const ENR = {
   amaraPhysics: "a0000000-0000-4000-8000-000000000061",
@@ -89,6 +91,21 @@ const ENR = {
   chloeEnglish: "a0000000-0000-4000-8000-000000000064",
   devChemistry: "a0000000-0000-4000-8000-000000000065",
   devMaths: "a0000000-0000-4000-8000-000000000066",
+  chloeMathsGroup: "a0000000-0000-4000-8000-000000000067", // shares Amara's group slot
+};
+// Slice B — weekly schedule slots (0=Sun..6=Sat). Mon=1 Tue=2 Wed=3 Thu=4 Fri=5.
+const ESCH = {
+  amaraPhysicsMon: "a0000000-0000-4000-8000-0000000000b1",
+  amaraPhysicsThu: "a0000000-0000-4000-8000-0000000000b2",
+  amaraMathsWed: "a0000000-0000-4000-8000-0000000000b3",
+  bilalMathsTue: "a0000000-0000-4000-8000-0000000000b4",
+  bilalMathsFri: "a0000000-0000-4000-8000-0000000000b5",
+  chloeEnglishWed: "a0000000-0000-4000-8000-0000000000b6",
+  chloeMathsWed: "a0000000-0000-4000-8000-0000000000b7",
+  devChemMon: "a0000000-0000-4000-8000-0000000000b8",
+  devChemThu: "a0000000-0000-4000-8000-0000000000b9",
+  devMathsTue: "a0000000-0000-4000-8000-0000000000ba",
+  devMathsFri: "a0000000-0000-4000-8000-0000000000bb",
 };
 // Slice C — homework/AI-correction dummy data.
 const WS = {
@@ -226,6 +243,7 @@ async function main() {
       { id: PRICE.y5EnglishGroup, tenantId: TENANT_ID, yearLevel: "Y5", subjectId: SUBJ.english, mode: "group", hourlyRateCents: 4000, defaultSessionMinutes: 90 },
       { id: PRICE.y8ChemistryOneToOne, tenantId: TENANT_ID, yearLevel: "Y8", subjectId: SUBJ.chemistry, mode: "one_to_one", hourlyRateCents: 7500, defaultSessionMinutes: 60 },
       { id: PRICE.y8MathsOneToOne, tenantId: TENANT_ID, yearLevel: "Y8", subjectId: SUBJ.maths, mode: "one_to_one", hourlyRateCents: 7500, defaultSessionMinutes: 60 },
+      { id: PRICE.y5MathsGroup, tenantId: TENANT_ID, yearLevel: "Y5", subjectId: SUBJ.maths, mode: "group", hourlyRateCents: 4000, defaultSessionMinutes: 90 },
     ])
     .onConflictDoUpdate({
       target: schema.priceListItems.id,
@@ -285,6 +303,7 @@ async function main() {
     { id: ENR.chloeEnglish, studentId: ST.chloe, subjectId: SUBJ.english, mode: "group" as const, priceId: PRICE.y5EnglishGroup, rate: 4000, minutes: 90 },
     { id: ENR.devChemistry, studentId: ST.dev, subjectId: SUBJ.chemistry, mode: "one_to_one" as const, priceId: PRICE.y8ChemistryOneToOne, rate: 7500, minutes: 60 },
     { id: ENR.devMaths, studentId: ST.dev, subjectId: SUBJ.maths, mode: "one_to_one" as const, priceId: PRICE.y8MathsOneToOne, rate: 7500, minutes: 60 },
+    { id: ENR.chloeMathsGroup, studentId: ST.chloe, subjectId: SUBJ.maths, mode: "group" as const, priceId: PRICE.y5MathsGroup, rate: 4000, minutes: 90 },
   ];
   await db
     .insert(schema.enrollments)
@@ -335,46 +354,85 @@ async function main() {
     ])
     .onConflictDoNothing();
 
-  // 11. Lessons — ~5 weeks of twice-weekly attendance PER ENROLLMENT so billing
-  // has real hours×rate numbers. Deterministic status (mostly present).
-  //
-  // Clear this tenant's lessons FIRST. Two reasons: (1) pre-pivot lessons have no
-  // enrollment_id (they'd show as "Unassigned" and inflate balances), and (2)
-  // lessons no longer have a natural unique key (the unique(student_id,date) was
-  // relaxed in Slice A), so onConflictDoNothing can't dedupe — without this a
-  // re-seed would STACK duplicate rows every run. Idempotent by construction.
+  // 11a. Weekly schedule slots (Slice B — doc 26 §2B). Recurrence lives here; the
+  // calendar renders virtual occurrences from these and persists a lesson only on
+  // touch. Clear FIRST so a re-run never stacks. Two slots are deliberately shaped
+  // for the demo: Amara + Chloe both do Maths GROUP on Wed 16:00 (visual-cluster),
+  // and Dev's Chemistry sits Mon 16:00 which OVERLAPS Amara's Physics Mon 15:30–
+  // 16:30 (a warn-not-block conflict).
+  const enrById = new Map(enrollmentDefs.map((e) => [e.id, e]));
+  const scheduleDefs = [
+    { id: ESCH.amaraPhysicsMon, enrollmentId: ENR.amaraPhysics, weekday: 1, startTime: "15:30" },
+    { id: ESCH.amaraPhysicsThu, enrollmentId: ENR.amaraPhysics, weekday: 4, startTime: "15:30" },
+    { id: ESCH.amaraMathsWed, enrollmentId: ENR.amaraMathsGroup, weekday: 3, startTime: "16:00" },
+    { id: ESCH.bilalMathsTue, enrollmentId: ENR.bilalMaths, weekday: 2, startTime: "17:00" },
+    { id: ESCH.bilalMathsFri, enrollmentId: ENR.bilalMaths, weekday: 5, startTime: "17:00" },
+    { id: ESCH.chloeEnglishWed, enrollmentId: ENR.chloeEnglish, weekday: 3, startTime: "09:30" },
+    { id: ESCH.chloeMathsWed, enrollmentId: ENR.chloeMathsGroup, weekday: 3, startTime: "16:00" },
+    { id: ESCH.devChemMon, enrollmentId: ENR.devChemistry, weekday: 1, startTime: "16:00" },
+    { id: ESCH.devChemThu, enrollmentId: ENR.devChemistry, weekday: 4, startTime: "18:00" },
+    { id: ESCH.devMathsTue, enrollmentId: ENR.devMaths, weekday: 2, startTime: "18:00" },
+    { id: ESCH.devMathsFri, enrollmentId: ENR.devMaths, weekday: 5, startTime: "18:00" },
+  ];
+  await db
+    .delete(schema.enrollmentSchedules)
+    .where(eq(schema.enrollmentSchedules.tenantId, TENANT_ID));
+  await db.insert(schema.enrollmentSchedules).values(
+    scheduleDefs.map((s) => ({
+      id: s.id,
+      tenantId: TENANT_ID,
+      enrollmentId: s.enrollmentId,
+      weekday: s.weekday,
+      startTime: s.startTime,
+      effectiveFrom: anchorIso,
+    })),
+  );
+
+  // 11b. Lessons — materialise ~5 weeks of PAST occurrences from those slots
+  // (deterministic status, mostly attended) so billing + the streak have real
+  // numbers. We stop at YESTERDAY: today + the rest of this week stay VIRTUAL, so
+  // the calendar demo has live "mark this day / this week" work to do. Clear
+  // FIRST (lessons have no natural unique key since Slice A — a re-run would
+  // otherwise stack duplicates). Idempotent by construction.
   await db.delete(schema.lessons).where(eq(schema.lessons.tenantId, TENANT_ID));
 
   const today = new Date();
   const lessonRows: (typeof schema.lessons.$inferInsert)[] = [];
 
-  for (let back = 0; back <= 35; back++) {
+  for (let back = 1; back <= 35; back++) {
     const d = new Date(today);
     d.setUTCDate(d.getUTCDate() - back);
-    const dow = d.getUTCDay(); // 1 = Mon, 4 = Thu
-    if (dow !== 1 && dow !== 4) continue;
+    const dow = d.getUTCDay(); // 0=Sun..6=Sat
     const iso = d.toISOString().slice(0, 10);
+    if (iso < anchorIso) continue;
 
-    enrollmentDefs.forEach((en, ei) => {
-      const seed = (ei + back) % 7;
-      const status: "present" | "absent" | "late" =
-        seed === 3 ? "absent" : seed === 5 ? "late" : "present";
+    scheduleDefs.forEach((slot, si) => {
+      if (slot.weekday !== dow) return;
+      const en = enrById.get(slot.enrollmentId);
+      if (!en) return;
+      const seed = (si + back) % 7;
+      const status: "attended" | "absent" | "late" =
+        seed === 3 ? "absent" : seed === 5 ? "late" : "attended";
       const amount = status === "absent" ? 0 : blockCents(en.minutes, en.rate);
       lessonRows.push({
         tenantId: TENANT_ID,
         studentId: en.studentId,
         enrollmentId: en.id,
         date: iso,
+        startsAt: sydneyWallToUtc(iso, slot.startTime),
         status,
+        origin: "recurring",
         durationMinutes: en.minutes,
         amountCents: amount,
       });
     });
   }
 
-  await db.insert(schema.lessons).values(lessonRows).onConflictDoNothing();
+  await db.insert(schema.lessons).values(lessonRows);
 
-  console.log(`Inserted/kept ${lessonRows.length} lesson rows.`);
+  console.log(
+    `Inserted ${scheduleDefs.length} schedule slots + ${lessonRows.length} past lesson rows.`,
+  );
 
   // 12. Homework / AI correction (Slice C). Clear the tenant's C-tables FIRST
   // (FK-safe order: corrections -> submissions -> assignments -> worksheets) so
@@ -429,10 +487,12 @@ async function main() {
   console.log("Seeded Slice C: 3 worksheets, 4 assignments, 3 submissions, 2 corrections.");
   console.log("\n✅ Seed complete.\n");
   console.log("Log in (magic link) to verify RLS:");
-  console.log(`  OWNER  ${ownerEmail}   → all 4 students, 6 enrollments`);
+  console.log(`  OWNER  ${ownerEmail}   → all 4 students, 7 enrollments, weekly calendar`);
   console.log(`  PARENT ${parent1Email} → Amara + Bilal only`);
   console.log(`  PARENT ${parent2Email} → Chloe only`);
-  console.log("\nMath check: Amara Maths group 90min @ $40/hr = $60/session.\n");
+  console.log("\nMath check: Amara Maths group 90min @ $40/hr = $60/session.");
+  console.log("Calendar demo: Wed 16:00 = Amara + Chloe Maths group (cluster);");
+  console.log("               Mon = Amara Physics 15:30 vs Dev Chemistry 16:00 (conflict).\n");
 }
 
 main()

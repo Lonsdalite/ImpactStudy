@@ -370,6 +370,47 @@ create policy enrollments_delete_staff on public.enrollments
   using (public.is_tenant_staff(tenant_id));
 
 -- ----------------------------------------------------------------------------
+-- 10c. enrollment_schedules (weekly recurrence — Slice B, doc 26 §2B)
+--      Recurrence lives here; the calendar renders virtual occurrences from these
+--      rows and persists a lesson only on touch. Staff manage tenant-wide; a
+--      parent may READ (only) their own child's slots for context ("what days is
+--      my kid on"). No parent writes; student role arrives in Slice D.
+-- ----------------------------------------------------------------------------
+alter table public.enrollment_schedules enable row level security;
+
+grant select, insert, update, delete on public.enrollment_schedules to authenticated;
+
+drop policy if exists enrollment_schedules_select_staff_or_parent on public.enrollment_schedules;
+create policy enrollment_schedules_select_staff_or_parent on public.enrollment_schedules
+  for select to authenticated
+  using (
+    public.is_tenant_staff(tenant_id)
+    or exists (
+      select 1
+      from public.enrollments e
+      join public.student_parents sp on sp.student_id = e.student_id
+      where e.id = public.enrollment_schedules.enrollment_id
+        and sp.parent_user_id = (select auth.uid())
+    )
+  );
+
+drop policy if exists enrollment_schedules_insert_staff on public.enrollment_schedules;
+create policy enrollment_schedules_insert_staff on public.enrollment_schedules
+  for insert to authenticated
+  with check (public.is_tenant_staff(tenant_id));
+
+drop policy if exists enrollment_schedules_update_staff on public.enrollment_schedules;
+create policy enrollment_schedules_update_staff on public.enrollment_schedules
+  for update to authenticated
+  using (public.is_tenant_staff(tenant_id))
+  with check (public.is_tenant_staff(tenant_id));
+
+drop policy if exists enrollment_schedules_delete_staff on public.enrollment_schedules;
+create policy enrollment_schedules_delete_staff on public.enrollment_schedules
+  for delete to authenticated
+  using (public.is_tenant_staff(tenant_id));
+
+-- ----------------------------------------------------------------------------
 -- 11. lessons (attendance/billing wedge — now enrollment-scoped)
 -- ----------------------------------------------------------------------------
 alter table public.lessons enable row level security;

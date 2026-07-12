@@ -12,6 +12,7 @@ const NAV: {
 }[] = [
   { href: "/dashboard", label: "Overview" },
   { href: "/dashboard/students", label: "Students", parentLabel: "Children" },
+  { href: "/dashboard/calendar", label: "Calendar", staffOnly: true },
   { href: "/dashboard/attendance", label: "Attendance", staffOnly: true },
   { href: "/dashboard/billing", label: "Billing", staffOnly: true },
   { href: "/dashboard/pricing", label: "Pricing", staffOnly: true },

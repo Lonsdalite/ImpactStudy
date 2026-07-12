@@ -12,10 +12,26 @@ import {
   modeLabel,
 } from "@/lib/billing";
 import {
+  prettyTime,
+  weekdayLong,
+  WEEKDAY_ORDER,
+} from "@/lib/calendar";
+import {
   createEnrollment,
   setEnrollmentActive,
 } from "@/lib/actions/enrollments";
+import {
+  addSchedule,
+  endSchedule,
+} from "@/lib/actions/calendar";
 import type { EnrollmentMode } from "@/lib/db/schema";
+
+export interface ScheduleSlotRow {
+  id: string;
+  weekday: number;
+  startTime: string;
+  durationOverride: number | null;
+}
 
 export interface EnrollmentRow {
   id: string;
@@ -25,6 +41,7 @@ export interface EnrollmentRow {
   sessionMinutes: number;
   currency: string;
   active: boolean;
+  schedules: ScheduleSlotRow[];
 }
 
 export interface SubjectOption {
@@ -99,29 +116,33 @@ export function EnrollmentsManager({
       ) : (
         <ul className="mt-3 divide-y divide-brand-mist rounded-xl border border-brand-mist">
           {active.map((en) => (
-            <li
-              key={en.id}
-              className="flex items-center justify-between gap-3 px-4 py-3"
-            >
-              <div className="min-w-0">
-                <p className="text-sm font-medium text-brand-plum">
-                  {en.subjectName}
-                  <span className="ml-2 rounded-full bg-brand-sage/15 px-2 py-0.5 text-[11px] font-medium text-brand-plum">
-                    {modeLabel(en.mode)}
-                  </span>
-                </p>
-                <p className="mt-0.5 text-xs text-brand-ink/55">
-                  {rateLine(en.hourlyRateCents, en.sessionMinutes, en.currency)}
-                </p>
+            <li key={en.id} className="px-4 py-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="text-sm font-medium text-brand-plum">
+                    {en.subjectName}
+                    <span className="ml-2 rounded-full bg-brand-sage/15 px-2 py-0.5 text-[11px] font-medium text-brand-plum">
+                      {modeLabel(en.mode)}
+                    </span>
+                  </p>
+                  <p className="mt-0.5 text-xs text-brand-ink/55">
+                    {rateLine(en.hourlyRateCents, en.sessionMinutes, en.currency)}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={isPending}
+                  onClick={() => toggle(en.id, false)}
+                  className="shrink-0 rounded-lg border border-brand-mist px-3 py-1.5 text-xs text-brand-ink/70 hover:border-brand-plum/30 hover:bg-brand-plum/[0.04] disabled:opacity-50"
+                >
+                  End
+                </button>
               </div>
-              <button
-                type="button"
-                disabled={isPending}
-                onClick={() => toggle(en.id, false)}
-                className="shrink-0 rounded-lg border border-brand-mist px-3 py-1.5 text-xs text-brand-ink/70 hover:border-brand-plum/30 hover:bg-brand-plum/[0.04] disabled:opacity-50"
-              >
-                End
-              </button>
+              <ScheduleEditor
+                enrollmentId={en.id}
+                sessionMinutes={en.sessionMinutes}
+                slots={en.schedules}
+              />
             </li>
           ))}
         </ul>
@@ -217,5 +238,144 @@ export function EnrollmentsManager({
         </details>
       ) : null}
     </section>
+  );
+}
+
+/**
+ * The weekly-slot editor for one enrollment — the "change days from now on"
+ * surface (doc 26 §2B). Adding a slot takes effect from today; ending a slot
+ * end-dates it (past weeks still render). This is deliberately distinct from the
+ * calendar's "reschedule this week" (a one-off makeup): here you change the
+ * recurring pattern.
+ */
+function ScheduleEditor({
+  enrollmentId,
+  sessionMinutes,
+  slots,
+}: {
+  enrollmentId: string;
+  sessionMinutes: number;
+  slots: ScheduleSlotRow[];
+}) {
+  const router = useRouter();
+  const [isPending, startTransition] = useTransition();
+  const [open, setOpen] = useState(false);
+  const [weekday, setWeekday] = useState(1); // Monday
+  const [startTime, setStartTime] = useState("16:00");
+
+  function add() {
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(startTime)) {
+      toast.error("Time must be HH:MM");
+      return;
+    }
+    startTransition(async () => {
+      const res = await addSchedule({ enrollmentId, weekday, startTime });
+      if (res.ok) {
+        toast.success("Weekly slot added — from now on");
+        setOpen(false);
+        router.refresh();
+      } else {
+        toast.error(res.error ?? "Couldn't add the slot");
+      }
+    });
+  }
+
+  function end(id: string) {
+    startTransition(async () => {
+      const res = await endSchedule(id);
+      if (res.ok) {
+        toast.success("Slot ended from today");
+        router.refresh();
+      } else {
+        toast.error("Couldn't end the slot");
+      }
+    });
+  }
+
+  return (
+    <div className="mt-2.5 rounded-lg bg-brand-cream/40 px-3 py-2">
+      {slots.length === 0 ? (
+        <p className="text-xs text-brand-ink/55">
+          No weekly time set — add one so it shows on the calendar.
+        </p>
+      ) : (
+        <ul className="flex flex-wrap gap-1.5">
+          {slots.map((s) => (
+            <li
+              key={s.id}
+              className="flex items-center gap-1.5 rounded-full border border-brand-mist bg-white px-2.5 py-1 text-xs text-brand-plum"
+            >
+              <span>
+                {weekdayLong(s.weekday)} {prettyTime(s.startTime)}
+                {s.durationOverride ? ` · ${formatDuration(s.durationOverride)}` : ""}
+              </span>
+              <button
+                type="button"
+                disabled={isPending}
+                onClick={() => end(s.id)}
+                className="text-brand-plum-mid hover:text-brand-plum disabled:opacity-50"
+                title="End this slot from today"
+              >
+                ×
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {open ? (
+        <div className="mt-2 flex flex-wrap items-end gap-2">
+          <label className="text-[11px] text-brand-ink/60">
+            Day
+            <select
+              value={weekday}
+              onChange={(e) => setWeekday(Number(e.target.value))}
+              className="mt-1 block rounded-lg border border-brand-mist bg-white px-2 py-1 text-sm text-brand-plum focus:outline-none"
+            >
+              {WEEKDAY_ORDER.map((w) => (
+                <option key={w.code} value={w.code}>
+                  {w.long}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="text-[11px] text-brand-ink/60">
+            Time
+            <input
+              type="time"
+              value={startTime}
+              onChange={(e) => setStartTime(e.target.value)}
+              className="mt-1 block rounded-lg border border-brand-mist bg-white px-2 py-1 text-sm text-brand-plum focus:outline-none"
+            />
+          </label>
+          <button
+            type="button"
+            disabled={isPending}
+            onClick={add}
+            className="rounded-lg bg-brand-plum px-3 py-1.5 text-xs font-medium text-brand-cream hover:bg-brand-plum-mid disabled:opacity-50"
+          >
+            Add slot
+          </button>
+          <button
+            type="button"
+            onClick={() => setOpen(false)}
+            className="text-xs text-brand-plum-mid hover:underline"
+          >
+            Cancel
+          </button>
+          <span className="text-[11px] text-brand-ink/45">
+            Inherits {formatDuration(sessionMinutes)} from the rate.
+          </span>
+        </div>
+      ) : (
+        <button
+          type="button"
+          onClick={() => setOpen(true)}
+          className="mt-2 text-xs text-brand-plum-mid hover:underline"
+        >
+          + Add a weekly time
+        </button>
+      )}
+    </div>
   );
 }

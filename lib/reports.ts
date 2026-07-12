@@ -20,12 +20,12 @@ export interface WeeklyStats {
   /** Inclusive window [start, end] in YYYY-MM-DD (Sydney). */
   windowStart: string;
   windowEnd: string;
-  attended: number; // present + late
-  present: number;
+  attended: number; // attended + late
+  present: number; // count of `attended`-status sessions (kept name for callers)
   late: number;
   absent: number;
   cancelled: number;
-  totalScheduled: number; // present + late + absent (cancelled excluded — not the student's doing)
+  totalScheduled: number; // attended + late + absent (cancelled excluded — not the student's doing)
   /** Sessions the student actually showed up to, newest first. */
   attendedSessions: { date: string; status: LessonStatus; note: string | null }[];
   /** Free-text notes left on this week's lessons, newest first. */
@@ -57,7 +57,7 @@ export function reportWindow(
   return { start: utcToIso(start), end: todayIso };
 }
 
-const ATTENDED: LessonStatus[] = ["present", "late"];
+const ATTENDED: LessonStatus[] = ["attended", "late"];
 
 /**
  * Compute the weekly summary from a student's lessons. `allLessons` may be the
@@ -78,7 +78,7 @@ export function weeklyStats(
   let absent = 0;
   let cancelled = 0;
   for (const l of inWindow) {
-    if (l.status === "present") present++;
+    if (l.status === "attended") present++;
     else if (l.status === "late") late++;
     else if (l.status === "absent") absent++;
     else if (l.status === "cancelled") cancelled++;
@@ -98,14 +98,17 @@ export function weeklyStats(
     .sort((a, b) => (a.date < b.date ? 1 : -1))
     .map((l) => ({ date: l.date, note: (l.note as string).trim() }));
 
-  // All-time streak: walk lessons newest→oldest, count consecutive attended
-  // until the first miss. cancelled rows don't break the streak (tutor's call).
+  // All-time attended streak (doc 26 §2B): count attended/late sessions. A plain
+  // missed session (absent/cancelled) is NOT counted but does NOT reset the streak
+  // — this avoids punishing a legit holiday/sick week (protects the warmth thesis).
+  // A `rescheduled` original is skipped too: its streak is carried by the makeup
+  // lesson (which appears as its own attended row once marked). `scheduled`
+  // (unresolved) rows are ignored. Net effect: misses never break the run.
   const chronological = [...allLessons].sort((a, b) => (a.date < b.date ? 1 : -1));
   let streak = 0;
   for (const l of chronological) {
-    if (l.status === "cancelled") continue;
     if (ATTENDED.includes(l.status)) streak++;
-    else break;
+    // absent / cancelled / rescheduled / scheduled → skip, never break.
   }
 
   return {

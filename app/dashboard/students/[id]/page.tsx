@@ -43,10 +43,12 @@ const METHOD_LABEL: Record<PaymentMethod, string> = {
 };
 
 const STATUS_LABEL: Record<LessonStatus, string> = {
-  present: "Present",
+  scheduled: "Scheduled",
+  attended: "Attended",
   late: "Late",
   absent: "Absent",
   cancelled: "Cancelled",
+  rescheduled: "Rescheduled",
 };
 
 interface StudentRow {
@@ -74,6 +76,15 @@ interface EnrollmentQueryRow {
   currency: string;
   active: boolean;
   subject: { name: string } | null;
+}
+interface ScheduleQueryRow {
+  id: string;
+  enrollment_id: string;
+  weekday: number;
+  start_time: string;
+  duration_override: number | null;
+  effective_to: string | null;
+  active: boolean;
 }
 interface PaymentRow {
   id: string;
@@ -180,6 +191,24 @@ export default async function StudentDetailPage({
   const payments = (paymentData ?? []) as unknown as PaymentRow[];
   const enrollmentRows = (enrollmentData ?? []) as unknown as EnrollmentQueryRow[];
   const subjects = (subjectData ?? []) as unknown as SubjectOption[];
+
+  // Current weekly slots (Slice B) for this student's enrollments — the recurring
+  // pattern the calendar renders from. "Current" = active + not yet end-dated.
+  const enrollmentIds = enrollmentRows.map((e) => e.id);
+  const { data: scheduleData } = isStaff && enrollmentIds.length
+    ? await supabase
+        .from("enrollment_schedules")
+        .select("id, enrollment_id, weekday, start_time, duration_override, effective_to, active")
+        .in("enrollment_id", enrollmentIds)
+    : { data: [] as ScheduleQueryRow[] };
+  const scheduleRows = (scheduleData ?? []) as unknown as ScheduleQueryRow[];
+  const slotsByEnrollment = new Map<string, ScheduleQueryRow[]>();
+  for (const s of scheduleRows) {
+    if (!s.active || s.effective_to !== null) continue; // current slots only
+    const arr = slotsByEnrollment.get(s.enrollment_id) ?? [];
+    arr.push(s);
+    slotsByEnrollment.set(s.enrollment_id, arr);
+  }
   const assignmentRows = (assignmentData ?? []) as unknown as AssignmentQueryRow[];
   const worksheetOptions = (worksheetOptionData ?? []) as unknown as WorksheetOptionRow[];
 
@@ -204,7 +233,7 @@ export default async function StudentDetailPage({
   // Subjects → hours → total rollup (attended blocks only, all-time).
   const rollup = new Map<string, { minutes: number; cents: number }>();
   for (const l of lessons) {
-    if (l.status !== "present" && l.status !== "late") continue;
+    if (l.status !== "attended" && l.status !== "late") continue;
     const subject = l.enrollment?.subject?.name ?? "Unassigned";
     const cur = rollup.get(subject) ?? { minutes: 0, cents: 0 };
     cur.minutes += l.duration_minutes;
@@ -228,6 +257,14 @@ export default async function StudentDetailPage({
     sessionMinutes: e.session_minutes,
     currency: e.currency,
     active: e.active,
+    schedules: (slotsByEnrollment.get(e.id) ?? [])
+      .map((s) => ({
+        id: s.id,
+        weekday: s.weekday,
+        startTime: s.start_time,
+        durationOverride: s.duration_override,
+      }))
+      .sort((a, b) => a.weekday - b.weekday || a.startTime.localeCompare(b.startTime)),
   }));
 
   return (
@@ -369,7 +406,7 @@ export default async function StudentDetailPage({
                   <span className="flex items-center gap-4">
                     <span
                       className={
-                        l.status === "present" || l.status === "late"
+                        l.status === "attended" || l.status === "late"
                           ? "text-brand-plum"
                           : "text-brand-ink/45"
                       }

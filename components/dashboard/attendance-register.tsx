@@ -49,13 +49,15 @@ export interface RegisterGuard {
 }
 
 const LABEL: Record<LessonStatus, string> = {
-  present: "Present",
+  scheduled: "Scheduled",
+  attended: "Attended",
   late: "Late",
   absent: "Absent",
   cancelled: "Cancelled",
+  rescheduled: "Rescheduled",
 };
 
-const ATTENDED = (s: LessonStatus) => s === "present" || s === "late";
+const ATTENDED = (s: LessonStatus) => s === "attended" || s === "late";
 
 export function AttendanceRegister({
   date,
@@ -103,7 +105,7 @@ export function AttendanceRegister({
 
   function addAnother(e: RegisterEnrollment) {
     startTransition(async () => {
-      const res = await addSession(e.enrollmentId, date, "present");
+      const res = await addSession(e.enrollmentId, date, "attended");
       if (!res.ok || !res.lessonId) {
         toast.error("Couldn't add a session");
         return;

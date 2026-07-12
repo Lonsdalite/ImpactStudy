@@ -11,6 +11,7 @@ import {
   index,
   unique,
   check,
+  type AnyPgColumn,
 } from "drizzle-orm/pg-core";
 import { relations, sql } from "drizzle-orm";
 import type { VoiceSignature } from "@/lib/voice-types";
@@ -364,21 +365,48 @@ export const tenantCorpusSubscriptions = pgTable(
 );
 
 // ---------- lessons ----------
-// One row = one attended block against an ENROLLMENT on one date. Doubles as
-// BOTH the attendance register AND the billing ledger line (attendance IS
-// billing — her #1 pain). amount_cents is the fee posted for this lesson,
-// snapshotted at mark time as round(duration_minutes / 60 × enrollment rate):
-//   present  -> hours × rate, late -> hours × rate (configurable later),
-//   absent   -> 0,            cancelled -> 0 (tutor-cancelled, no charge).
+// One row = one block against an ENROLLMENT on one date/time. Doubles as BOTH the
+// attendance register AND the billing ledger line (attendance IS billing — her #1
+// pain). Slice B turns lessons into the persisted overlay on top of VIRTUAL
+// calendar occurrences: a row exists ONLY once a slot is acted on (attendance,
+// reschedule, or note) — no pre-generated future rows (doc 26 §2B, Google
+// Calendar RECURRENCE-ID model). amount_cents is the fee posted, snapshotted at
+// mark time as round(duration_minutes / 60 × enrollment rate) unless a
+// fee_override_cents is set (future per-tenant late-cancel fees — inert in pilot):
+//   attended -> hours × rate, late -> hours × rate (configurable later),
+//   scheduled/absent/cancelled/rescheduled -> 0.
 // A student's invoice for a cycle = sum(amount_cents) across ALL their
 // enrollments' lessons in that cycle. Multiple lessons per student per day are
 // allowed (different enrollments, or a double session); the one-per-enrollment-
 // per-day convention is enforced in app code, not the DB (doc 27 §2.3).
+//
+// Status taxonomy (doc 26 §2B — wide + billing-safe, multi-tenant-safe):
+//   scheduled   : a materialised-but-unresolved occurrence (e.g. a future one-off
+//                 makeup, or a slot touched only to attach a note). $0.
+//   attended    : the student showed up (was `present` pre-Slice-B). Bills.
+//   late         : showed up late. Bills the full block (configurable later).
+//   absent       : didn't show. $0 (Slice A rule — no no-show fee in pilot).
+//   cancelled    : tutor cancelled. $0.
+//   rescheduled  : struck by a "reschedule this week" — $0, links to the makeup
+//                  via rescheduled_to_lesson_id. Never a manual choice.
 export const lessonStatusEnum = pgEnum("lesson_status", [
-  "present",
-  "absent",
+  "scheduled",
+  "attended",
   "late",
+  "absent",
   "cancelled",
+  "rescheduled",
+]);
+
+// Where a lesson row came from (doc 26 §2B):
+//   recurring : materialised from an enrollment_schedules weekly slot.
+//   makeup    : the one-off created BY a reschedule (carries the billing + streak
+//               of the struck original). Does not itself recur.
+//   oneoff    : a bare extra class outside any recurrence (double session, ad-hoc).
+export const lessonOriginEnum = pgEnum("lesson_origin", [
+  "recurring",
+  "makeup",
+  "oneoff",
 ]);
 
 export const lessons = pgTable(
@@ -396,12 +424,30 @@ export const lessons = pgTable(
     enrollmentId: uuid("enrollment_id").references(() => enrollments.id, {
       onDelete: "cascade",
     }),
-    date: date("date").notNull(), // 'YYYY-MM-DD' (the lesson day)
+    date: date("date").notNull(), // 'YYYY-MM-DD' (the lesson day, Sydney)
+    // The occurrence datetime (date + slot start_time, Sydney wall clock). Slice B
+    // renders the calendar off this; `date` remains the billing/reporting day key.
+    // Nullable so a legacy/date-only row still loads.
+    startsAt: timestamp("starts_at", { withTimezone: true }),
     status: lessonStatusEnum("status").notNull(),
+    // How this row was created (recurring slot / reschedule makeup / bare one-off).
+    origin: lessonOriginEnum("origin").default("recurring").notNull(),
+    // For a rescheduled original: points at the makeup lesson that carries its
+    // billing + streak. Null otherwise. Self-ref, set null if the makeup is deleted.
+    rescheduledToLessonId: uuid("rescheduled_to_lesson_id").references(
+      (): AnyPgColumn => lessons.id,
+      { onDelete: "set null" },
+    ),
     // The block billed, in minutes. Defaults from the enrollment's
     // session_minutes; overridable for a long / double class.
     durationMinutes: integer("duration_minutes").default(0).notNull(),
+    // Posted fee (authoritative ledger amount), snapshotted at mark time.
     amountCents: integer("amount_cents").default(0).notNull(),
+    // Optional per-lesson fee override (doc 26 §2B "nullable fee"). NULL = derive
+    // from status × block (the pilot path). A future tenant that charges a
+    // late-cancel/no-show fee sets this per lesson — a config toggle, not a
+    // migration. Inert in the pilot; billing stays exactly Slice A.
+    feeOverrideCents: integer("fee_override_cents"),
     note: text("note"),
     createdAt: timestamp("created_at", { withTimezone: true })
       .defaultNow()
@@ -409,12 +455,52 @@ export const lessons = pgTable(
   },
   (t) => [
     // No unique(student_id, date): a student may have several lessons a day
-    // (different enrollments or a double session). One-per-enrollment-per-day is
-    // a code convention (doc 27 §2.3); firm occurrence identity arrives in B.
+    // (different enrollments or a double session). Occurrence identity is
+    // (enrollment_id, date) for a recurring slot; makeups/one-offs are keyed by id.
     index("lessons_tenant_idx").on(t.tenantId),
     index("lessons_student_idx").on(t.studentId),
     index("lessons_enrollment_idx").on(t.enrollmentId),
     index("lessons_date_idx").on(t.date),
+  ],
+);
+
+// ---------- enrollment_schedules (weekly recurrence — Slice B) ----------
+// Recurrence lives HERE, not on pre-generated lesson rows (doc 26 §2B). Each
+// enrollment owns 1..n weekly slots {weekday, start_time, duration_override?,
+// effective_from, effective_to}. The calendar RENDERS computed occurrences from
+// these; a lessons row is persisted only when a slot is acted on. No RRULE /
+// fortnightly / nth-weekday — weekly only (Fatima has nothing else). "Change days
+// from now on" = end-date the old slot (effective_to) + add a new one.
+//   weekday: 0=Sunday .. 6=Saturday (JS Date.getUTCDay convention).
+//   start_time: 'HH:MM' 24h (Sydney wall clock).
+//   duration_override: minutes; NULL = inherit the enrollment's session_minutes.
+export const enrollmentSchedules = pgTable(
+  "enrollment_schedules",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    enrollmentId: uuid("enrollment_id")
+      .notNull()
+      .references(() => enrollments.id, { onDelete: "cascade" }),
+    weekday: integer("weekday").notNull(), // 0=Sun .. 6=Sat
+    startTime: text("start_time").notNull(), // 'HH:MM'
+    durationOverride: integer("duration_override"), // null = inherit enrollment
+    effectiveFrom: date("effective_from").notNull(), // 'YYYY-MM-DD'
+    effectiveTo: date("effective_to"), // null = ongoing
+    active: boolean("active").default(true).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (t) => [
+    index("enrollment_schedules_tenant_idx").on(t.tenantId),
+    index("enrollment_schedules_enrollment_idx").on(t.enrollmentId),
+    check(
+      "enrollment_schedules_weekday_ck",
+      sql`${t.weekday} >= 0 AND ${t.weekday} <= 6`,
+    ),
   ],
 );
 
@@ -693,6 +779,7 @@ export const tenantsRelations = relations(tenants, ({ many }) => ({
   subjects: many(subjects),
   priceListItems: many(priceListItems),
   enrollments: many(enrollments),
+  enrollmentSchedules: many(enrollmentSchedules),
   corpusSources: many(corpusSources),
   corpusSubscriptions: many(tenantCorpusSubscriptions),
   lessons: many(lessons),
@@ -821,7 +908,22 @@ export const enrollmentsRelations = relations(enrollments, ({ one, many }) => ({
     references: [priceListItems.id],
   }),
   lessons: many(lessons),
+  schedules: many(enrollmentSchedules),
 }));
+
+export const enrollmentSchedulesRelations = relations(
+  enrollmentSchedules,
+  ({ one }) => ({
+    tenant: one(tenants, {
+      fields: [enrollmentSchedules.tenantId],
+      references: [tenants.id],
+    }),
+    enrollment: one(enrollments, {
+      fields: [enrollmentSchedules.enrollmentId],
+      references: [enrollments.id],
+    }),
+  }),
+);
 
 export const corpusSourcesRelations = relations(
   corpusSources,
@@ -904,6 +1006,11 @@ export const lessonsRelations = relations(lessons, ({ one }) => ({
     fields: [lessons.enrollmentId],
     references: [enrollments.id],
   }),
+  rescheduledTo: one(lessons, {
+    fields: [lessons.rescheduledToLessonId],
+    references: [lessons.id],
+    relationName: "reschedule",
+  }),
 }));
 
 export const reportsRelations = relations(reports, ({ one }) => ({
@@ -963,6 +1070,9 @@ export type NewTenantCorpusSubscription =
 export type Lesson = typeof lessons.$inferSelect;
 export type NewLesson = typeof lessons.$inferInsert;
 export type LessonStatus = (typeof lessonStatusEnum.enumValues)[number];
+export type LessonOrigin = (typeof lessonOriginEnum.enumValues)[number];
+export type EnrollmentSchedule = typeof enrollmentSchedules.$inferSelect;
+export type NewEnrollmentSchedule = typeof enrollmentSchedules.$inferInsert;
 export type Payment = typeof payments.$inferSelect;
 export type NewPayment = typeof payments.$inferInsert;
 export type PaymentMethod = (typeof paymentMethodEnum.enumValues)[number];

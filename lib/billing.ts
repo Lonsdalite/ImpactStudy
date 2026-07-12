@@ -8,11 +8,14 @@ import type {
  * Attendance-driven billing helpers. Pure functions (no server-only) so both
  * server components and the client can format money consistently.
  *
- * Slice A billing (doc 26 §2 / doc 27 §2.5): a lesson posts a fee snapshotted at
- * mark time = round(duration_minutes / 60 × hourly_rate_cents), gated by status:
- *   present / late     -> hours × rate
- *   absent / cancelled -> 0
+ * Slice A billing (doc 26 §2 / doc 27 §2.5), UNCHANGED by Slice B: a lesson posts
+ * a fee snapshotted at mark time = round(duration_minutes / 60 × hourly_rate_cents),
+ * gated by status:
+ *   attended / late                        -> hours × rate
+ *   scheduled / absent / cancelled / rescheduled -> 0
  * "Late" charging full is a deliberate default; make it configurable later.
+ * A reschedule nets ONE billed session: the struck original is $0 (rescheduled)
+ * and the makeup carries the block (doc 26 §2B).
  */
 
 /** The dollars-in-cents value of a billed block: round(minutes/60 × hourlyRate). */
@@ -32,15 +35,39 @@ export function blockAmountCents(
  */
 export function feeForStatus(status: LessonStatus, blockCents: number): number {
   switch (status) {
-    case "present":
+    case "attended":
     case "late":
       return blockCents;
+    case "scheduled":
     case "absent":
     case "cancelled":
+    case "rescheduled":
       return 0;
     default:
       return 0;
   }
+}
+
+/**
+ * The posted fee for a lesson, honouring an optional per-lesson override (doc 26
+ * §2B). In the pilot `feeOverrideCents` is always null → identical to Slice A.
+ * A future tenant that charges a late-cancel/no-show fee sets the override.
+ */
+export function postedFee(
+  status: LessonStatus,
+  blockCents: number,
+  feeOverrideCents: number | null | undefined,
+): number {
+  if (feeOverrideCents != null && Number.isFinite(feeOverrideCents)) {
+    return Math.round(feeOverrideCents);
+  }
+  return feeForStatus(status, blockCents);
+}
+
+/** Statuses that count as "the student attended" (bills + feeds the streak). */
+export const ATTENDED_STATUSES: LessonStatus[] = ["attended", "late"];
+export function isAttended(status: LessonStatus): boolean {
+  return status === "attended" || status === "late";
 }
 
 // ---------- enrollment mode + session length ----------
@@ -81,15 +108,28 @@ export function formatMoney(cents: number, currency = "AUD"): string {
   }).format(cents / 100);
 }
 
+// The manually-settable outcomes on the register/drill-down. `scheduled` and
+// `rescheduled` are never manual choices (scheduled = untouched; rescheduled is
+// set by the reschedule action), so they're not offered as buttons.
 export const LESSON_STATUSES: {
   value: LessonStatus;
   label: string;
 }[] = [
-  { value: "present", label: "Present" },
+  { value: "attended", label: "Attended" },
   { value: "late", label: "Late" },
   { value: "absent", label: "Absent" },
   { value: "cancelled", label: "Cancelled" },
 ];
+
+// Human labels for every status (incl. the non-manual ones) for read surfaces.
+export const LESSON_STATUS_LABEL: Record<LessonStatus, string> = {
+  scheduled: "Scheduled",
+  attended: "Attended",
+  late: "Late",
+  absent: "Absent",
+  cancelled: "Cancelled",
+  rescheduled: "Rescheduled",
+};
 
 /** First and last day (YYYY-MM-DD) of the month containing `isoDate`. */
 export function monthBounds(isoDate: string): { start: string; end: string } {

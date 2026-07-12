@@ -17,7 +17,7 @@ import type { LessonStatus } from "@/lib/db/schema";
  * never trust a tenant_id from the client.
  */
 
-const VALID: LessonStatus[] = ["present", "absent", "late", "cancelled"];
+const VALID: LessonStatus[] = ["attended", "absent", "late", "cancelled"];
 
 type SB = Awaited<ReturnType<typeof createClient>>;
 
@@ -268,10 +268,10 @@ export async function markAllPresent(
       student_id: e.student_id,
       enrollment_id: e.id,
       date,
-      status: "present" as const,
+      status: "attended" as const,
       duration_minutes: e.session_minutes,
       amount_cents: feeForStatus(
-        "present",
+        "attended",
         blockAmountCents(e.session_minutes, e.hourly_rate_cents),
       ),
     }));

@@ -49,7 +49,7 @@ export async function generateWeeklyReport(input: {
     `Window: ${shortDate(stats.windowStart)} to ${shortDate(stats.windowEnd)} (this week).`,
   );
   facts.push(
-    `Attended ${stats.attended} of ${stats.totalScheduled} scheduled sessions (present: ${stats.present}, late: ${stats.late}, absent: ${stats.absent}).`,
+    `Attended ${stats.attended} of ${stats.totalScheduled} scheduled sessions (on time: ${stats.present}, late: ${stats.late}, absent: ${stats.absent}).`,
   );
   if (stats.streak >= 2) {
     facts.push(`Current attendance streak: ${stats.streak} sessions in a row.`);
