@@ -15,6 +15,7 @@ const NAV: {
   { href: "/dashboard/attendance", label: "Attendance", staffOnly: true },
   { href: "/dashboard/billing", label: "Billing", staffOnly: true },
   { href: "/dashboard/pricing", label: "Pricing", staffOnly: true },
+  { href: "/dashboard/homework", label: "Homework", staffOnly: true },
   { href: "/dashboard/practice", label: "Practice" },
   { href: "/dashboard/voice", label: "Voice", staffOnly: true },
   { href: "/dashboard/reports", label: "Reports", parentLabel: "Progress" },

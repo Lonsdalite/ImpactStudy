@@ -14,6 +14,12 @@ import {
 } from "drizzle-orm/pg-core";
 import { relations, sql } from "drizzle-orm";
 import type { VoiceSignature } from "@/lib/voice-types";
+import type {
+  SubmissionPage,
+  CorrectionItem,
+  CorrectionStats,
+  UploaderRole,
+} from "@/lib/homework-types";
 
 /**
  * Roles inside a tenant. A user can have different roles in different tenants
@@ -45,6 +51,35 @@ export const billingCycleEnum = pgEnum("billing_cycle", [
 export const enrollmentModeEnum = pgEnum("enrollment_mode", [
   "one_to_one",
   "group",
+]);
+
+// ---------- homework / AI correction (Slice C — doc 26 §2C) ----------
+// Per-student assignment pipeline. The wide enum is billing/state-safe and
+// leaves room for D's student-facing flow: assigned -> submitted -> corrected
+// -> returned, plus `archived` for cancel/tidy. "up next" is derived from
+// order_index over the not-yet-returned rows, not a separate status.
+export const assignmentStatusEnum = pgEnum("assignment_status", [
+  "assigned",
+  "submitted",
+  "corrected",
+  "returned",
+  "archived",
+]);
+
+// A correction is DRAFT (AI-written, tutor-only) until the tutor RELEASES it.
+// Same trust spine as reports (draft -> sent): review-before-release is
+// non-negotiable (doc 26 §2C). A parent may only ever read a released one.
+export const correctionStatusEnum = pgEnum("correction_status", [
+  "draft",
+  "released",
+]);
+
+// Who uploaded a submission. Polymorphic in the model; pilot = tutor only.
+// student/parent uploads arrive with Slice D.
+export const uploaderRoleEnum = pgEnum("uploader_role", [
+  "tutor",
+  "student",
+  "parent",
 ]);
 
 // ---------- tenants ----------
@@ -474,6 +509,181 @@ export const reports = pgTable(
   ],
 );
 
+// ---------- worksheets (tenant library — Slice C) ----------
+// A reusable, tenant-scoped file Fatima uploads ONCE and assigns REPEATEDLY
+// across students and years (doc 26 §2C). Tagged by subject + year (+ optional
+// topic/order) so she can find the next one. DISTINCT from the RAG baseline
+// corpus (corpus_sources / doc 17): that is the model's knowledge; this is her
+// assignable files. The bytes live in the private `worksheets` storage bucket;
+// `storage_path` is the object key (`${tenantId}/${worksheetId}/${file}`).
+export const worksheets = pgTable(
+  "worksheets",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    title: text("title").notNull(),
+    // Tags. subject is a soft FK (set null on subject delete); year/topic/order
+    // are free-form so the library isn't rigid.
+    subjectId: uuid("subject_id").references(() => subjects.id, {
+      onDelete: "set null",
+    }),
+    yearLevel: text("year_level"), // "Y6"
+    topic: text("topic"), // "Fractions → decimals"
+    orderIndex: integer("order_index"), // optional sequence within a topic
+    storagePath: text("storage_path").notNull(), // object key in `worksheets` bucket
+    fileName: text("file_name").notNull(),
+    fileMime: text("file_mime").notNull(),
+    active: boolean("active").default(true).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (t) => [
+    index("worksheets_tenant_idx").on(t.tenantId),
+    index("worksheets_subject_idx").on(t.subjectId),
+  ],
+);
+
+// ---------- assignments (per-student pipeline — Slice C) ----------
+// One row = one worksheet placed in a student's queue (or an ad-hoc "do this"
+// with no library file). Curation is per-student and ad-hoc (doc 26 §2C) — no
+// shared curriculum. `order_index` drives the "up next" pointer (lowest index
+// among not-yet-returned). worksheet_id is OPTIONAL so a bare "bring your book"
+// assignment works; submission (below) can also stand alone with no assignment.
+export const assignments = pgTable(
+  "assignments",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    studentId: uuid("student_id")
+      .notNull()
+      .references(() => students.id, { onDelete: "cascade" }),
+    // Optional context — which enrollment/subject this belongs to (for filtering
+    // + the future diligence→report join). Nullable so a quick assignment needs
+    // no enrollment.
+    enrollmentId: uuid("enrollment_id").references(() => enrollments.id, {
+      onDelete: "set null",
+    }),
+    subjectId: uuid("subject_id").references(() => subjects.id, {
+      onDelete: "set null",
+    }),
+    worksheetId: uuid("worksheet_id").references(() => worksheets.id, {
+      onDelete: "set null",
+    }),
+    // Denormalised label so the pipeline reads even if the worksheet is archived
+    // or the assignment is ad-hoc (no worksheet).
+    title: text("title").notNull(),
+    status: assignmentStatusEnum("status").default("assigned").notNull(),
+    dueDate: date("due_date"), // 'YYYY-MM-DD'; null = no hard due date
+    // Per-student queue ordering. Lower = sooner; the lowest not-returned row is
+    // "up next". Defaults high so new rows land at the back until reordered.
+    orderIndex: integer("order_index").default(1000).notNull(),
+    note: text("note"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (t) => [
+    index("assignments_tenant_idx").on(t.tenantId),
+    index("assignments_student_idx").on(t.studentId),
+    index("assignments_status_idx").on(t.status),
+  ],
+);
+
+// ---------- submissions (the unit of record — Slice C) ----------
+// 1..n image pages or a PDF of a student's work. May attach to an assignment OR
+// STAND ALONE (snap a notebook page, correct on the spot — never force
+// assignment-first, doc 26 §2C). `uploader_role` is polymorphic (pilot = tutor).
+// Files live in the private `submissions` bucket; `pages` holds their object
+// keys + display metadata.
+export const submissions = pgTable(
+  "submissions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    studentId: uuid("student_id")
+      .notNull()
+      .references(() => students.id, { onDelete: "cascade" }),
+    // Optional link to an assignment; null = standalone (notebook-photo path).
+    assignmentId: uuid("assignment_id").references(() => assignments.id, {
+      onDelete: "set null",
+    }),
+    // Denormalised subject for standalone submissions (no assignment behind them).
+    subjectId: uuid("subject_id").references(() => subjects.id, {
+      onDelete: "set null",
+    }),
+    uploaderRole: uploaderRoleEnum("uploader_role")
+      .$type<UploaderRole>()
+      .default("tutor")
+      .notNull(),
+    uploadedBy: uuid("uploaded_by").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    // The uploaded pages (object keys in the `submissions` bucket + metadata).
+    pages: jsonb("pages").$type<SubmissionPage[]>().default([]).notNull(),
+    note: text("note"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (t) => [
+    index("submissions_tenant_idx").on(t.tenantId),
+    index("submissions_student_idx").on(t.studentId),
+    index("submissions_assignment_idx").on(t.assignmentId),
+  ],
+);
+
+// ---------- corrections (AI draft -> tutor release — Slice C) ----------
+// One correction per submission. AI DRAFTS per-item verdicts + a voiced note in
+// the tutor's voice; the tutor reviews/edits every item and RELEASES. No
+// trusted-auto-release (doc 26 §2C). `stats` is the tally snapshot the report/
+// diligence reads (frozen at release). Red-pen-on-image is deferred.
+export const corrections = pgTable(
+  "corrections",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    submissionId: uuid("submission_id")
+      .notNull()
+      .references(() => submissions.id, { onDelete: "cascade" }),
+    studentId: uuid("student_id")
+      .notNull()
+      .references(() => students.id, { onDelete: "cascade" }),
+    status: correctionStatusEnum("status").default("draft").notNull(),
+    // Per-question verdicts (right/wrong/partial + comment). Editable pre-release.
+    items: jsonb("items").$type<CorrectionItem[]>().default([]).notNull(),
+    // The short feedback note in the tutor's voice, referencing the work.
+    voicedNote: text("voiced_note"),
+    // Tally snapshot ({total,right,wrong,partial}) for the report — frozen at
+    // release so a later edit is captured deterministically.
+    stats: jsonb("stats").$type<CorrectionStats>(),
+    model: text("model"), // which model drafted it (transparency)
+    releasedAt: timestamp("released_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (t) => [
+    // One correction per submission — re-drafting overwrites the draft, never
+    // stacks. (A released correction is edited in place, then re-released.)
+    unique("corrections_submission_unique").on(t.submissionId),
+    index("corrections_tenant_idx").on(t.tenantId),
+    index("corrections_student_idx").on(t.studentId),
+    index("corrections_status_idx").on(t.status),
+  ],
+);
+
 // ---------- relations ----------
 // Drizzle relations API for ergonomic joins from query builder.
 
@@ -488,6 +698,85 @@ export const tenantsRelations = relations(tenants, ({ many }) => ({
   lessons: many(lessons),
   payments: many(payments),
   reports: many(reports),
+  worksheets: many(worksheets),
+  assignments: many(assignments),
+  submissions: many(submissions),
+  corrections: many(corrections),
+}));
+
+export const worksheetsRelations = relations(worksheets, ({ one, many }) => ({
+  tenant: one(tenants, {
+    fields: [worksheets.tenantId],
+    references: [tenants.id],
+  }),
+  subject: one(subjects, {
+    fields: [worksheets.subjectId],
+    references: [subjects.id],
+  }),
+  assignments: many(assignments),
+}));
+
+export const assignmentsRelations = relations(assignments, ({ one, many }) => ({
+  tenant: one(tenants, {
+    fields: [assignments.tenantId],
+    references: [tenants.id],
+  }),
+  student: one(students, {
+    fields: [assignments.studentId],
+    references: [students.id],
+  }),
+  enrollment: one(enrollments, {
+    fields: [assignments.enrollmentId],
+    references: [enrollments.id],
+  }),
+  subject: one(subjects, {
+    fields: [assignments.subjectId],
+    references: [subjects.id],
+  }),
+  worksheet: one(worksheets, {
+    fields: [assignments.worksheetId],
+    references: [worksheets.id],
+  }),
+  submissions: many(submissions),
+}));
+
+export const submissionsRelations = relations(submissions, ({ one, many }) => ({
+  tenant: one(tenants, {
+    fields: [submissions.tenantId],
+    references: [tenants.id],
+  }),
+  student: one(students, {
+    fields: [submissions.studentId],
+    references: [students.id],
+  }),
+  assignment: one(assignments, {
+    fields: [submissions.assignmentId],
+    references: [assignments.id],
+  }),
+  subject: one(subjects, {
+    fields: [submissions.subjectId],
+    references: [subjects.id],
+  }),
+  uploader: one(users, {
+    fields: [submissions.uploadedBy],
+    references: [users.id],
+  }),
+  corrections: many(corrections),
+}));
+
+export const correctionsRelations = relations(corrections, ({ one }) => ({
+  tenant: one(tenants, {
+    fields: [corrections.tenantId],
+    references: [tenants.id],
+  }),
+  submission: one(submissions, {
+    fields: [corrections.submissionId],
+    references: [submissions.id],
+  }),
+  student: one(students, {
+    fields: [corrections.studentId],
+    references: [students.id],
+  }),
 }));
 
 export const subjectsRelations = relations(subjects, ({ one, many }) => ({
@@ -586,6 +875,9 @@ export const studentsRelations = relations(students, ({ one, many }) => ({
   lessons: many(lessons),
   payments: many(payments),
   reports: many(reports),
+  assignments: many(assignments),
+  submissions: many(submissions),
+  corrections: many(corrections),
 }));
 
 export const paymentsRelations = relations(payments, ({ one }) => ({
@@ -678,3 +970,13 @@ export type BillingCycle = (typeof billingCycleEnum.enumValues)[number];
 export type Report = typeof reports.$inferSelect;
 export type NewReport = typeof reports.$inferInsert;
 export type ReportStatus = (typeof reportStatusEnum.enumValues)[number];
+export type Worksheet = typeof worksheets.$inferSelect;
+export type NewWorksheet = typeof worksheets.$inferInsert;
+export type Assignment = typeof assignments.$inferSelect;
+export type NewAssignment = typeof assignments.$inferInsert;
+export type AssignmentStatus = (typeof assignmentStatusEnum.enumValues)[number];
+export type Submission = typeof submissions.$inferSelect;
+export type NewSubmission = typeof submissions.$inferInsert;
+export type Correction = typeof corrections.$inferSelect;
+export type NewCorrection = typeof corrections.$inferInsert;
+export type CorrectionStatus = (typeof correctionStatusEnum.enumValues)[number];

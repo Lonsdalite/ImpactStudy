@@ -19,7 +19,13 @@ import {
   type EnrollmentRow,
   type SubjectOption,
 } from "@/components/dashboard/enrollments-manager";
+import {
+  AssignmentTracker,
+  type TrackerAssignment,
+  type TrackerWorksheet,
+} from "@/components/dashboard/assignment-tracker";
 import type {
+  AssignmentStatus,
   BillingCycle,
   EnrollmentMode,
   LessonStatus,
@@ -75,6 +81,18 @@ interface PaymentRow {
   method: PaymentMethod;
   amount_cents: number;
 }
+interface AssignmentQueryRow {
+  id: string;
+  title: string;
+  status: AssignmentStatus;
+  due_date: string | null;
+  order_index: number;
+  subject: { name: string } | null;
+}
+interface WorksheetOptionRow {
+  id: string;
+  title: string;
+}
 
 function prettyDate(iso: string): string {
   const [y, m, d] = iso.split("-").map(Number);
@@ -114,6 +132,8 @@ export default async function StudentDetailPage({
     { data: paymentData },
     { data: enrollmentData },
     { data: subjectData },
+    { data: assignmentData },
+    { data: worksheetOptionData },
   ] = await Promise.all([
     supabase
       .from("lessons")
@@ -142,11 +162,39 @@ export default async function StudentDetailPage({
           .eq("active", true)
           .order("name", { ascending: true })
       : Promise.resolve({ data: [] as SubjectOption[] }),
+    supabase
+      .from("assignments")
+      .select("id, title, status, due_date, order_index, subject:subjects(name)")
+      .eq("student_id", id)
+      .order("order_index", { ascending: true }),
+    isStaff
+      ? supabase
+          .from("worksheets")
+          .select("id, title")
+          .eq("tenant_id", result.tenant.tenantId)
+          .eq("active", true)
+          .order("title", { ascending: true })
+      : Promise.resolve({ data: [] as WorksheetOptionRow[] }),
   ]);
   const lessons = (lessonData ?? []) as unknown as LessonRow[];
   const payments = (paymentData ?? []) as unknown as PaymentRow[];
   const enrollmentRows = (enrollmentData ?? []) as unknown as EnrollmentQueryRow[];
   const subjects = (subjectData ?? []) as unknown as SubjectOption[];
+  const assignmentRows = (assignmentData ?? []) as unknown as AssignmentQueryRow[];
+  const worksheetOptions = (worksheetOptionData ?? []) as unknown as WorksheetOptionRow[];
+
+  const trackerAssignments: TrackerAssignment[] = assignmentRows.map((a) => ({
+    id: a.id,
+    title: a.title,
+    status: a.status,
+    subjectName: a.subject?.name ?? null,
+    dueDate: a.due_date,
+    orderIndex: a.order_index,
+  }));
+  const trackerWorksheets: TrackerWorksheet[] = worksheetOptions.map((w) => ({
+    id: w.id,
+    title: w.title,
+  }));
 
   // Running balance (all-time) — what the student currently owes.
   const billed = lessons.reduce((s, l) => s + l.amount_cents, 0);
@@ -255,6 +303,15 @@ export default async function StudentDetailPage({
             subjects={subjects}
             enrollments={enrollments}
             hasYearLevel={!!student.year_level}
+          />
+        ) : null}
+
+        {/* Homework pipeline — staff only */}
+        {isStaff ? (
+          <AssignmentTracker
+            studentId={student.id}
+            worksheets={trackerWorksheets}
+            assignments={trackerAssignments}
           />
         ) : null}
 

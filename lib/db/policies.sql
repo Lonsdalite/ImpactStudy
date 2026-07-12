@@ -491,6 +491,168 @@ create policy reports_delete_staff on public.reports
   using (public.is_tenant_staff(tenant_id));
 
 -- ----------------------------------------------------------------------------
+-- 11d. Homework & AI correction (Slice C — doc 26 §2C):
+--      worksheets, assignments, submissions, corrections.
+--      Staff write tenant-wide. A parent is low-touch (§2D): read-only on their
+--      own child's assignments + submissions for context, and on a correction
+--      ONLY once it's RELEASED (mirrors the reports "sent-only" trust gate).
+--      Worksheets are the tenant's private library — staff only. The `student`
+--      role stays out until Slice D.
+-- ----------------------------------------------------------------------------
+alter table public.worksheets   enable row level security;
+alter table public.assignments  enable row level security;
+alter table public.submissions  enable row level security;
+alter table public.corrections  enable row level security;
+
+grant select, insert, update, delete on public.worksheets   to authenticated;
+grant select, insert, update, delete on public.assignments  to authenticated;
+grant select, insert, update, delete on public.submissions  to authenticated;
+grant select, insert, update, delete on public.corrections  to authenticated;
+
+-- worksheets: staff-only (the tenant's private assignable library).
+drop policy if exists worksheets_select_staff on public.worksheets;
+create policy worksheets_select_staff on public.worksheets
+  for select to authenticated
+  using (public.is_tenant_staff(tenant_id));
+
+drop policy if exists worksheets_insert_staff on public.worksheets;
+create policy worksheets_insert_staff on public.worksheets
+  for insert to authenticated
+  with check (public.is_tenant_staff(tenant_id));
+
+drop policy if exists worksheets_update_staff on public.worksheets;
+create policy worksheets_update_staff on public.worksheets
+  for update to authenticated
+  using (public.is_tenant_staff(tenant_id))
+  with check (public.is_tenant_staff(tenant_id));
+
+drop policy if exists worksheets_delete_staff on public.worksheets;
+create policy worksheets_delete_staff on public.worksheets
+  for delete to authenticated
+  using (public.is_tenant_staff(tenant_id));
+
+-- assignments: staff full write; a parent reads their own child's queue.
+drop policy if exists assignments_select_staff_or_parent on public.assignments;
+create policy assignments_select_staff_or_parent on public.assignments
+  for select to authenticated
+  using (
+    public.is_tenant_staff(tenant_id)
+    or exists (
+      select 1
+      from public.student_parents sp
+      where sp.student_id = public.assignments.student_id
+        and sp.parent_user_id = (select auth.uid())
+    )
+  );
+
+drop policy if exists assignments_insert_staff on public.assignments;
+create policy assignments_insert_staff on public.assignments
+  for insert to authenticated
+  with check (public.is_tenant_staff(tenant_id));
+
+drop policy if exists assignments_update_staff on public.assignments;
+create policy assignments_update_staff on public.assignments
+  for update to authenticated
+  using (public.is_tenant_staff(tenant_id))
+  with check (public.is_tenant_staff(tenant_id));
+
+drop policy if exists assignments_delete_staff on public.assignments;
+create policy assignments_delete_staff on public.assignments
+  for delete to authenticated
+  using (public.is_tenant_staff(tenant_id));
+
+-- submissions: staff full write; a parent reads their own child's submissions.
+drop policy if exists submissions_select_staff_or_parent on public.submissions;
+create policy submissions_select_staff_or_parent on public.submissions
+  for select to authenticated
+  using (
+    public.is_tenant_staff(tenant_id)
+    or exists (
+      select 1
+      from public.student_parents sp
+      where sp.student_id = public.submissions.student_id
+        and sp.parent_user_id = (select auth.uid())
+    )
+  );
+
+drop policy if exists submissions_insert_staff on public.submissions;
+create policy submissions_insert_staff on public.submissions
+  for insert to authenticated
+  with check (public.is_tenant_staff(tenant_id));
+
+drop policy if exists submissions_update_staff on public.submissions;
+create policy submissions_update_staff on public.submissions
+  for update to authenticated
+  using (public.is_tenant_staff(tenant_id))
+  with check (public.is_tenant_staff(tenant_id));
+
+drop policy if exists submissions_delete_staff on public.submissions;
+create policy submissions_delete_staff on public.submissions
+  for delete to authenticated
+  using (public.is_tenant_staff(tenant_id));
+
+-- corrections: staff full write; a parent may read ONLY a RELEASED correction
+-- for their own child (the returned feedback, §2D). Drafts stay tutor-only —
+-- enforced here, not just the UI (a parent querying directly can't see a draft).
+drop policy if exists corrections_select_staff_or_parent on public.corrections;
+create policy corrections_select_staff_or_parent on public.corrections
+  for select to authenticated
+  using (
+    public.is_tenant_staff(tenant_id)
+    or (
+      status = 'released'
+      and exists (
+        select 1
+        from public.student_parents sp
+        where sp.student_id = public.corrections.student_id
+          and sp.parent_user_id = (select auth.uid())
+      )
+    )
+  );
+
+drop policy if exists corrections_insert_staff on public.corrections;
+create policy corrections_insert_staff on public.corrections
+  for insert to authenticated
+  with check (public.is_tenant_staff(tenant_id));
+
+drop policy if exists corrections_update_staff on public.corrections;
+create policy corrections_update_staff on public.corrections
+  for update to authenticated
+  using (public.is_tenant_staff(tenant_id))
+  with check (public.is_tenant_staff(tenant_id));
+
+drop policy if exists corrections_delete_staff on public.corrections;
+create policy corrections_delete_staff on public.corrections
+  for delete to authenticated
+  using (public.is_tenant_staff(tenant_id));
+
+-- ----------------------------------------------------------------------------
+-- 11e. Supabase Storage — private buckets for worksheet + submission files.
+--      Path convention: `${tenant_id}/${...}` — the FIRST path segment is the
+--      tenant uuid, so a single predicate scopes every object to its tenant's
+--      staff. Uploads/reads happen on the supabase-js path (RLS-enforced);
+--      the app hands out short-lived signed URLs, never public links.
+--      Parent/student read of submission IMAGES is deferred to Slice D (in C a
+--      parent only sees the released text feedback, not the scanned page).
+-- ----------------------------------------------------------------------------
+insert into storage.buckets (id, name, public)
+values ('worksheets', 'worksheets', false), ('submissions', 'submissions', false)
+on conflict (id) do nothing;
+
+-- Staff of the tenant named by the first path segment get full object access.
+drop policy if exists homework_objects_staff_all on storage.objects;
+create policy homework_objects_staff_all on storage.objects
+  for all to authenticated
+  using (
+    bucket_id in ('worksheets', 'submissions')
+    and public.is_tenant_staff(((storage.foldername(name))[1])::uuid)
+  )
+  with check (
+    bucket_id in ('worksheets', 'submissions')
+    and public.is_tenant_staff(((storage.foldername(name))[1])::uuid)
+  );
+
+-- ----------------------------------------------------------------------------
 -- 12. Tell PostgREST to reload its schema cache (so new grants/tables show up
 --     on the Data API immediately — Day 1 set "auto-expose new tables: OFF").
 -- ----------------------------------------------------------------------------

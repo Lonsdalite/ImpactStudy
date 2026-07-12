@@ -28,6 +28,7 @@ import { eq, inArray } from "drizzle-orm";
 import { createClient, type User } from "@supabase/supabase-js";
 import * as schema from "./schema";
 import { FATIMA_VOICE } from "../voice-types";
+import { tallyItems, type CorrectionItem, type SubmissionPage } from "../homework-types";
 
 // ---------- env ----------
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -88,6 +89,27 @@ const ENR = {
   chloeEnglish: "a0000000-0000-4000-8000-000000000064",
   devChemistry: "a0000000-0000-4000-8000-000000000065",
   devMaths: "a0000000-0000-4000-8000-000000000066",
+};
+// Slice C — homework/AI-correction dummy data.
+const WS = {
+  fractions: "a0000000-0000-4000-8000-000000000071",
+  balancing: "a0000000-0000-4000-8000-000000000072",
+  comprehension: "a0000000-0000-4000-8000-000000000073",
+};
+const AS = {
+  amaraFractions: "a0000000-0000-4000-8000-000000000081", // assigned
+  bilalPages: "a0000000-0000-4000-8000-000000000082", // submitted (awaiting correction)
+  devBalancing: "a0000000-0000-4000-8000-000000000083", // corrected (draft)
+  chloeComprehension: "a0000000-0000-4000-8000-000000000084", // returned (released)
+};
+const SUB = {
+  bilal: "a0000000-0000-4000-8000-000000000091",
+  dev: "a0000000-0000-4000-8000-000000000092",
+  chloe: "a0000000-0000-4000-8000-000000000093",
+};
+const CORR = {
+  dev: "a0000000-0000-4000-8000-0000000000a1",
+  chloe: "a0000000-0000-4000-8000-0000000000a2",
 };
 
 // ---------- clients ----------
@@ -353,6 +375,58 @@ async function main() {
   await db.insert(schema.lessons).values(lessonRows).onConflictDoNothing();
 
   console.log(`Inserted/kept ${lessonRows.length} lesson rows.`);
+
+  // 12. Homework / AI correction (Slice C). Clear the tenant's C-tables FIRST
+  // (FK-safe order: corrections -> submissions -> assignments -> worksheets) so
+  // a re-run never stacks duplicates — same discipline as the lessons reseed.
+  await db.delete(schema.corrections).where(eq(schema.corrections.tenantId, TENANT_ID));
+  await db.delete(schema.submissions).where(eq(schema.submissions.tenantId, TENANT_ID));
+  await db.delete(schema.assignments).where(eq(schema.assignments.tenantId, TENANT_ID));
+  await db.delete(schema.worksheets).where(eq(schema.worksheets.tenantId, TENANT_ID));
+
+  // A placeholder page so the pipeline/board render without real files (dummy
+  // data — the storage object doesn't exist, so signed URLs resolve to null and
+  // the UI just omits the thumbnail).
+  const placeholderPages: SubmissionPage[] = [
+    { path: `${TENANT_ID}/seed/placeholder.jpg`, name: "work.jpg", mime: "image/jpeg" },
+  ];
+
+  await db.insert(schema.worksheets).values([
+    { id: WS.fractions, tenantId: TENANT_ID, title: "Fractions → decimals, set 3", subjectId: SUBJ.maths, yearLevel: "Y6", topic: "Ratio & proportion", storagePath: `${TENANT_ID}/seed/fractions.pdf`, fileName: "fractions-set-3.pdf", fileMime: "application/pdf" },
+    { id: WS.balancing, tenantId: TENANT_ID, title: "Balancing equations intro", subjectId: SUBJ.chemistry, yearLevel: "Y8", topic: "Stoichiometry", storagePath: `${TENANT_ID}/seed/balancing.pdf`, fileName: "balancing-intro.pdf", fileMime: "application/pdf" },
+    { id: WS.comprehension, tenantId: TENANT_ID, title: "Comprehension: The Lighthouse", subjectId: SUBJ.english, yearLevel: "Y5", topic: "Inference", storagePath: `${TENANT_ID}/seed/lighthouse.pdf`, fileName: "lighthouse.pdf", fileMime: "application/pdf" },
+  ]);
+
+  await db.insert(schema.assignments).values([
+    { id: AS.amaraFractions, tenantId: TENANT_ID, studentId: ST.amara, enrollmentId: ENR.amaraMathsGroup, subjectId: SUBJ.maths, worksheetId: WS.fractions, title: "Fractions → decimals, set 3", status: "assigned", orderIndex: 1 },
+    { id: AS.bilalPages, tenantId: TENANT_ID, studentId: ST.bilal, enrollmentId: ENR.bilalMaths, subjectId: SUBJ.maths, title: "Textbook p.42 Q1–10", status: "submitted", orderIndex: 1 },
+    { id: AS.devBalancing, tenantId: TENANT_ID, studentId: ST.dev, enrollmentId: ENR.devChemistry, subjectId: SUBJ.chemistry, worksheetId: WS.balancing, title: "Balancing equations intro", status: "corrected", orderIndex: 1 },
+    { id: AS.chloeComprehension, tenantId: TENANT_ID, studentId: ST.chloe, enrollmentId: ENR.chloeEnglish, subjectId: SUBJ.english, worksheetId: WS.comprehension, title: "Comprehension: The Lighthouse", status: "returned", orderIndex: 1 },
+  ]);
+
+  await db.insert(schema.submissions).values([
+    { id: SUB.bilal, tenantId: TENANT_ID, studentId: ST.bilal, assignmentId: AS.bilalPages, subjectId: SUBJ.maths, uploaderRole: "tutor", pages: placeholderPages },
+    { id: SUB.dev, tenantId: TENANT_ID, studentId: ST.dev, assignmentId: AS.devBalancing, subjectId: SUBJ.chemistry, uploaderRole: "tutor", pages: placeholderPages },
+    { id: SUB.chloe, tenantId: TENANT_ID, studentId: ST.chloe, assignmentId: AS.chloeComprehension, subjectId: SUBJ.english, uploaderRole: "tutor", pages: placeholderPages },
+  ]);
+
+  const devItems: CorrectionItem[] = [
+    { number: 1, verdict: "right", comment: "Balanced cleanly, coefficients all correct." },
+    { number: 2, verdict: "partial", comment: "Right products, but recount your oxygens — they don't balance yet." },
+    { number: 3, verdict: "wrong", comment: "Needs a coefficient of 2 on the left. Have another go." },
+  ];
+  const chloeItems: CorrectionItem[] = [
+    { number: 1, verdict: "right", comment: "You picked the exact line that shows how the keeper feels." },
+    { number: 2, verdict: "right", comment: "Good inference about the storm, backed with evidence." },
+    { number: 3, verdict: "partial", comment: "Nearly there — just tie your answer back to the question." },
+  ];
+
+  await db.insert(schema.corrections).values([
+    { id: CORR.dev, tenantId: TENANT_ID, submissionId: SUB.dev, studentId: ST.dev, status: "draft", items: devItems, voicedNote: "Hey Dev, solid effort on the balancing set. Q1 was spot on. On Q2 just recount your oxygens, and Q3 needs one more coefficient. You're really getting the hang of this.", stats: tallyItems(devItems), model: "claude-sonnet-5" },
+    { id: CORR.chloe, tenantId: TENANT_ID, submissionId: SUB.chloe, studentId: ST.chloe, status: "released", items: chloeItems, voicedNote: "Hi Chloe, lovely work on The Lighthouse. Your evidence in Q1 and Q2 was exactly right. Just tie Q3 back to the question and it's perfect. I can see you're putting the effort in!", stats: tallyItems(chloeItems), model: "claude-sonnet-5", releasedAt: new Date() },
+  ]);
+
+  console.log("Seeded Slice C: 3 worksheets, 4 assignments, 3 submissions, 2 corrections.");
   console.log("\n✅ Seed complete.\n");
   console.log("Log in (magic link) to verify RLS:");
   console.log(`  OWNER  ${ownerEmail}   → all 4 students, 6 enrollments`);
