@@ -61,12 +61,22 @@ interface StudentRow {
   billing_anchor: string | null;
   created_at: string;
 }
+interface LessonQueryRow {
+  date: string;
+  status: LessonStatus;
+  duration_minutes: number;
+  amount_cents: number;
+  // Staff query embeds the subject; the parent_lessons view returns the plain
+  // enrollment_id instead (subject name resolved from enrollmentRows below).
+  enrollment?: { subject: { name: string } | null } | null;
+  enrollment_id?: string | null;
+}
 interface LessonRow {
   date: string;
   status: LessonStatus;
   duration_minutes: number;
   amount_cents: number;
-  enrollment: { subject: { name: string } | null } | null;
+  subjectName: string | null;
 }
 interface EnrollmentQueryRow {
   id: string;
@@ -146,13 +156,21 @@ export default async function StudentDetailPage({
     { data: assignmentData },
     { data: worksheetOptionData },
   ] = await Promise.all([
-    supabase
-      .from("lessons")
-      .select(
-        "date, status, duration_minutes, amount_cents, enrollment:enrollments(subject:subjects(name))",
-      )
-      .eq("student_id", id)
-      .order("date", { ascending: false }),
+    // Staff read the base table; parents read the column-safe parent_lessons
+    // view (base table is staff-only in RLS since Slice B.5 — no `note`).
+    isStaff
+      ? supabase
+          .from("lessons")
+          .select(
+            "date, status, duration_minutes, amount_cents, enrollment:enrollments(subject:subjects(name))",
+          )
+          .eq("student_id", id)
+          .order("date", { ascending: false })
+      : supabase
+          .from("parent_lessons")
+          .select("date, status, duration_minutes, amount_cents, enrollment_id")
+          .eq("student_id", id)
+          .order("date", { ascending: false }),
     supabase
       .from("payments")
       .select("id, paid_on, method, amount_cents")
@@ -187,10 +205,25 @@ export default async function StudentDetailPage({
           .order("title", { ascending: true })
       : Promise.resolve({ data: [] as WorksheetOptionRow[] }),
   ]);
-  const lessons = (lessonData ?? []) as unknown as LessonRow[];
   const payments = (paymentData ?? []) as unknown as PaymentRow[];
   const enrollmentRows = (enrollmentData ?? []) as unknown as EnrollmentQueryRow[];
   const subjects = (subjectData ?? []) as unknown as SubjectOption[];
+
+  // Normalise the two lesson shapes (staff embed vs parent view) to one.
+  const subjectByEnrollment = new Map(
+    enrollmentRows.map((e) => [e.id, e.subject?.name ?? null]),
+  );
+  const lessons: LessonRow[] = (
+    (lessonData ?? []) as unknown as LessonQueryRow[]
+  ).map((l) => ({
+    date: l.date,
+    status: l.status,
+    duration_minutes: l.duration_minutes,
+    amount_cents: l.amount_cents,
+    subjectName:
+      l.enrollment?.subject?.name ??
+      (l.enrollment_id ? subjectByEnrollment.get(l.enrollment_id) ?? null : null),
+  }));
 
   // Current weekly slots (Slice B) for this student's enrollments — the recurring
   // pattern the calendar renders from. "Current" = active + not yet end-dated.
@@ -234,7 +267,7 @@ export default async function StudentDetailPage({
   const rollup = new Map<string, { minutes: number; cents: number }>();
   for (const l of lessons) {
     if (l.status !== "attended" && l.status !== "late") continue;
-    const subject = l.enrollment?.subject?.name ?? "Unassigned";
+    const subject = l.subjectName ?? "Unassigned";
     const cur = rollup.get(subject) ?? { minutes: 0, cents: 0 };
     cur.minutes += l.duration_minutes;
     cur.cents += l.amount_cents;
@@ -399,7 +432,7 @@ export default async function StudentDetailPage({
                   <span className="text-brand-ink/75">
                     {prettyDate(l.date)}
                     <span className="ml-2 text-xs text-brand-ink/45">
-                      {l.enrollment?.subject?.name ?? "—"} ·{" "}
+                      {l.subjectName ?? "—"} ·{" "}
                       {formatDuration(l.duration_minutes)}
                     </span>
                   </span>

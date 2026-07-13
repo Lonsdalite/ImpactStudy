@@ -21,7 +21,12 @@ export async function GET(request: NextRequest) {
   const code = requestUrl.searchParams.get("code");
   const tokenHash = requestUrl.searchParams.get("token_hash");
   const type = requestUrl.searchParams.get("type") as EmailOtpType | null;
-  const next = requestUrl.searchParams.get("next") ?? "/dashboard";
+  // `next` must be an in-app path. Anything absolute ("https://evil.com") or
+  // protocol-relative ("//evil.com") would make our auth flow an open
+  // redirect / phishing primitive — fall back to the dashboard.
+  const rawNext = requestUrl.searchParams.get("next") ?? "/dashboard";
+  const next =
+    rawNext.startsWith("/") && !rawNext.startsWith("//") ? rawNext : "/dashboard";
 
   const redirectToLogin = (message: string) => {
     const loginUrl = new URL("/login", request.url);

@@ -63,26 +63,37 @@ export async function setStudentActive(
   studentId: string,
   active: boolean,
 ): Promise<{ ok: boolean }> {
-  if (!studentId) return { ok: false };
+  const tenant = await requireStaff();
+  if (!tenant || !studentId) return { ok: false };
   const supabase = await createClient();
-  const { error } = await supabase
+  const { data: updated, error } = await supabase
     .from("students")
     .update({ active })
-    .eq("id", studentId);
+    .eq("id", studentId)
+    .eq("tenant_id", tenant.tenantId)
+    .select("id");
   revalidatePath("/dashboard", "layout");
-  return { ok: !error };
+  return { ok: !error && (updated ?? []).length > 0 };
 }
 
-/** Permanent delete — cascades enrollments, lessons + payments. Mistakes only. */
+/**
+ * Permanent delete — cascades enrollments, lessons + payments (the student's
+ * entire billing ledger). Mistakes only. Staff-checked in code (not just RLS),
+ * scoped to the active tenant, and row-count-verified: an RLS no-op can never
+ * report success on a destructive call.
+ */
 export async function deleteStudent(
   studentId: string,
 ): Promise<{ ok: boolean }> {
-  if (!studentId) return { ok: false };
+  const tenant = await requireStaff();
+  if (!tenant || !studentId) return { ok: false };
   const supabase = await createClient();
-  const { error } = await supabase
+  const { data: deleted, error } = await supabase
     .from("students")
     .delete()
-    .eq("id", studentId);
+    .eq("id", studentId)
+    .eq("tenant_id", tenant.tenantId)
+    .select("id");
   revalidatePath("/dashboard", "layout");
-  return { ok: !error };
+  return { ok: !error && (deleted ?? []).length > 0 };
 }

@@ -1,9 +1,12 @@
 /**
- * Apply lib/db/policies.sql to the database.
+ * Apply lib/db/policies.sql to the database, then ASSERT that row-level
+ * security is enabled on every public table (Slice B.5 / Fable §1 P1 — an
+ * RLS-off table on the PostgREST path is a fully open table, so this fails
+ * loudly instead of trusting convention).
  *
- *   pnpm db:policies
+ *   pnpm db:policies        (also chained onto pnpm db:migrate)
  *
- * Runs AFTER `pnpm db:push` (the corpus tables must exist first). Idempotent —
+ * Runs AFTER `pnpm db:migrate` (the tables must exist first). Idempotent —
  * re-run any time policies.sql changes. Prefers DIRECT_URL (session pooler,
  * 5432) for DDL; falls back to DATABASE_URL. No psql dependency.
  */
@@ -38,6 +41,27 @@ async function main() {
     // (functions, triggers, policies) to run in one round-trip.
     await sql.unsafe(sqlText).simple();
     console.log("✅ policies.sql applied");
+
+    // RLS-on assertion: every table in public must have rowsecurity. Views
+    // (parent_lessons, parent_corrections) live in pg_views, not pg_tables, so
+    // they don't trip this.
+    const open = await sql<{ tablename: string }[]>`
+      select tablename
+      from pg_tables
+      where schemaname = 'public' and not rowsecurity
+      order by tablename
+    `;
+    if (open.length > 0) {
+      console.error(
+        `❌ RLS IS OFF on ${open.length} public table(s): ` +
+          open.map((r) => r.tablename).join(", ") +
+          "\n   Every public table must have row-level security enabled. " +
+          "Fix policies.sql (§2 / the table's section) and re-run pnpm db:policies.",
+      );
+      process.exitCode = 1;
+      return;
+    }
+    console.log("✅ RLS is enabled on every public table");
   } catch (err) {
     console.error("❌ Failed to apply policies.sql:\n", err);
     process.exitCode = 1;

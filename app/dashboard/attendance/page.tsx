@@ -186,8 +186,9 @@ export default async function AttendancePage({
           Attendance
         </h1>
         <p className="mt-2 text-sm text-brand-ink/65">
-          Mark all present, then fix the exceptions. Fees post automatically —
-          attended hours × the hourly rate; absent and cancelled charge nothing.
+          Per-enrollment exceptions and extra sessions. Bulk marking lives on
+          the Calendar. Fees post automatically — attended hours × the hourly
+          rate; absent and cancelled charge nothing.
         </p>
 
         {/* Date nav */}

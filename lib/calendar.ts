@@ -237,6 +237,8 @@ export interface Occurrence {
   note: string | null;
   /** Posted fee if persisted, else the fee this occurrence WOULD bill if attended. */
   amountCents: number;
+  /** Per-lesson fee override (persisted rows only; null = derive from status). */
+  feeOverrideCents: number | null;
   markable: boolean; // at/earlier than now
   rescheduledToLessonId: string | null;
 }
@@ -295,6 +297,7 @@ export function computeWeekOccurrences(params: {
         origin: "recurring",
         note: null,
         amountCents: blockAmountCents(duration, enr.hourlyRateCents),
+        feeOverrideCents: null,
         markable: isMarkable(date, slot.startTime, now),
         rescheduledToLessonId: null,
       };
@@ -369,6 +372,7 @@ function persistedToOccurrence(
     origin: l.origin,
     note: l.note,
     amountCents: l.amountCents,
+    feeOverrideCents: l.feeOverrideCents,
     markable: isMarkable(l.date, startTime, now),
     rescheduledToLessonId: l.rescheduledToLessonId,
   };
@@ -476,6 +480,6 @@ export function projectedFee(occ: Occurrence): number {
   return postedFee(
     "attended",
     blockAmountCents(occ.durationMinutes, occ.hourlyRateCents),
-    null,
+    occ.feeOverrideCents,
   );
 }
