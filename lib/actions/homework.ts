@@ -26,6 +26,23 @@ async function requireStaff() {
   return res.tenant;
 }
 
+/**
+ * Upload hardening (Slice B.5 / Fable §1 Storage):
+ *  - MIME allowlist: images + PDF only. An uploaded HTML/SVG served back via a
+ *    signed URL would be stored XSS on the Supabase origin.
+ *  - Path prefix: the object key MUST live under the ACTIVE tenant's folder —
+ *    a two-tenant staff member could otherwise cross-link records to the other
+ *    tenant's objects.
+ */
+function isAllowedMime(mime: string | null | undefined): boolean {
+  if (!mime) return false;
+  return mime.startsWith("image/") || mime === "application/pdf";
+}
+
+function isTenantPath(path: string | null | undefined, tenantId: string): boolean {
+  return !!path && path.startsWith(`${tenantId}/`) && !path.includes("..");
+}
+
 // ---------------------------------------------------------------------------
 // Worksheets (tenant library)
 // ---------------------------------------------------------------------------
@@ -47,6 +64,12 @@ export async function createWorksheet(input: {
   if (!input.storagePath || !input.fileName) {
     return { ok: false, error: "The file didn't upload — try again." };
   }
+  if (!isAllowedMime(input.fileMime)) {
+    return { ok: false, error: "Only images and PDFs can be worksheets." };
+  }
+  if (!isTenantPath(input.storagePath, tenant.tenantId)) {
+    return { ok: false, error: "The file didn't upload — try again." };
+  }
 
   const supabase = await createClient();
   const { error } = await supabase.from("worksheets").insert({
@@ -57,7 +80,7 @@ export async function createWorksheet(input: {
     topic: input.topic?.trim() || null,
     storage_path: input.storagePath,
     file_name: input.fileName,
-    file_mime: input.fileMime || "application/octet-stream",
+    file_mime: input.fileMime,
   });
   if (error) return { ok: false, error: "Couldn't save the worksheet." };
   revalidatePath("/dashboard/homework/library");
@@ -203,6 +226,14 @@ export async function createSubmission(input: {
       ok: false,
       error: `Up to ${MAX_SUBMISSION_PAGES} pages per submission.`,
     };
+  }
+  for (const p of input.pages) {
+    if (!isAllowedMime(p.mime)) {
+      return { ok: false, error: "Only photos and PDFs can be submitted." };
+    }
+    if (!isTenantPath(p.path, tenant.tenantId)) {
+      return { ok: false, error: "The upload didn't finish — try again." };
+    }
   }
 
   const supabase = await createClient();

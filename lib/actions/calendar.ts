@@ -10,7 +10,7 @@ import {
   sydneyWallToUtc,
   weekDates,
 } from "@/lib/calendar";
-import { blockAmountCents, feeForStatus } from "@/lib/billing";
+import { blockAmountCents, postedFee } from "@/lib/billing";
 import type { LessonStatus } from "@/lib/db/schema";
 
 /**
@@ -28,6 +28,18 @@ import type { LessonStatus } from "@/lib/db/schema";
  *      per-occurrence loop — each member is its own occurrence).
  *
  * RLS enforces staff-only writes; we never trust a tenant_id from the client.
+ *
+ * Slice B.5 hardening (Fable review):
+ *   - Occurrence identity is enforced by the DB (partial unique index on
+ *     (enrollment_id, date, starts_at) where origin='recurring'), and every
+ *     materialising insert here tolerates a unique_violation (23505) — a
+ *     double-tap or a second tab can never double-bill.
+ *   - Reschedule + its undo run inside single-transaction RPCs with a
+ *     re-entrancy guard (original must be scheduled + unlinked) and a lossless
+ *     undo payload (prevStatus/prevAmount).
+ *   - Every amount_cents write routes through postedFee(status, block,
+ *     fee_override_cents) — identical numbers while overrides are null (pilot),
+ *     but the doc 26 §2B override seam actually works.
  */
 
 const SB = () => createClient();
@@ -60,6 +72,12 @@ async function getEnrollment(
 
 function isValidTime(t: string): boolean {
   return /^([01]\d|2[0-3]):[0-5]\d$/.test(t);
+}
+
+/** Postgres unique_violation — the occurrence row already exists (someone else
+ *  materialised it first). Never an error we surface as corruption. */
+function isUniqueViolation(error: { code?: string } | null): boolean {
+  return error?.code === "23505";
 }
 
 // ---------- batch marking (mark this day / this week) ----------
@@ -95,16 +113,18 @@ async function markOccurrences(dates: string[]): Promise<MarkResult> {
   );
 
   const reverts: BatchRevert[] = [];
-  const toInsert: Record<string, unknown>[] = [];
 
   for (const o of target) {
-    const amount = feeForStatus(
+    const amount = postedFee(
       "attended",
       blockAmountCents(o.durationMinutes, o.hourlyRateCents),
+      o.feeOverrideCents,
     );
     if (o.lessonId) {
       // A persisted `scheduled` row (e.g. a note-only touch or a makeup) → attend.
-      await supabase
+      // Guarded to status='scheduled' so a concurrent manual exception is never
+      // clobbered; only a row we actually flipped joins the undo batch.
+      const { data: updated } = await supabase
         .from("lessons")
         .update({
           status: "attended",
@@ -112,30 +132,42 @@ async function markOccurrences(dates: string[]): Promise<MarkResult> {
           duration_minutes: o.durationMinutes,
           starts_at: sydneyWallToUtc(o.date, o.startTime).toISOString(),
         })
-        .eq("id", o.lessonId);
-      reverts.push({ id: o.lessonId, action: "scheduled" });
+        .eq("id", o.lessonId)
+        .eq("status", "scheduled")
+        .select("id");
+      if ((updated ?? []).length > 0) {
+        reverts.push({ id: o.lessonId, action: "scheduled" });
+      }
     } else {
-      toInsert.push({
-        tenant_id: staff.tenantId,
-        student_id: o.studentId,
-        enrollment_id: o.enrollmentId,
-        date: o.date,
-        starts_at: sydneyWallToUtc(o.date, o.startTime).toISOString(),
-        status: "attended",
-        origin: "recurring",
-        duration_minutes: o.durationMinutes,
-        amount_cents: amount,
-      });
-    }
-  }
-
-  if (toInsert.length > 0) {
-    const { data: inserted } = await supabase
-      .from("lessons")
-      .insert(toInsert)
-      .select("id");
-    for (const r of (inserted ?? []) as unknown as { id: string }[]) {
-      reverts.push({ id: r.id, action: "delete" });
+      // Materialise the virtual occurrence. Inserted one row at a time so a
+      // unique_violation (someone else marked it in between — double-tap,
+      // second tab) skips JUST that occurrence instead of failing the batch.
+      const { data: inserted, error } = await supabase
+        .from("lessons")
+        .insert({
+          tenant_id: staff.tenantId,
+          student_id: o.studentId,
+          enrollment_id: o.enrollmentId,
+          date: o.date,
+          starts_at: sydneyWallToUtc(o.date, o.startTime).toISOString(),
+          status: "attended",
+          origin: "recurring",
+          duration_minutes: o.durationMinutes,
+          amount_cents: amount,
+        })
+        .select("id")
+        .single();
+      if (!error && inserted) {
+        reverts.push({
+          id: (inserted as unknown as { id: string }).id,
+          action: "delete",
+        });
+      } else if (error && !isUniqueViolation(error)) {
+        // A real failure (not "already materialised") — stop and report what
+        // we did so the undo toast is accurate.
+        revalidatePath("/dashboard", "layout");
+        return { ok: false, count: reverts.length, reverts };
+      }
     }
   }
 
@@ -202,21 +234,34 @@ export async function setOccurrenceStatus(
     Number.isFinite(ref.durationMinutes) && ref.durationMinutes > 0
       ? Math.round(ref.durationMinutes)
       : enr.session_minutes;
-  const amount = feeForStatus(status, blockAmountCents(duration, enr.hourly_rate_cents));
+  const block = blockAmountCents(duration, enr.hourly_rate_cents);
 
   if (ref.lessonId) {
     const { data: existing } = await supabase
       .from("lessons")
-      .select("status")
+      .select("status, fee_override_cents")
       .eq("id", ref.lessonId)
       .single();
-    const prev = (existing as unknown as { status: LessonStatus } | null)?.status ?? null;
-    const { error } = await supabase
+    const row = existing as unknown as {
+      status: LessonStatus;
+      fee_override_cents: number | null;
+    } | null;
+    if (!row) return { ok: false, lessonId: null, prev: null };
+    const { data: updated, error } = await supabase
       .from("lessons")
-      .update({ status, amount_cents: amount, duration_minutes: duration })
-      .eq("id", ref.lessonId);
+      .update({
+        status,
+        amount_cents: postedFee(status, block, row.fee_override_cents),
+        duration_minutes: duration,
+      })
+      .eq("id", ref.lessonId)
+      .select("id");
     revalidatePath("/dashboard", "layout");
-    return { ok: !error, lessonId: ref.lessonId, prev };
+    return {
+      ok: !error && (updated ?? []).length > 0,
+      lessonId: ref.lessonId,
+      prev: row.status,
+    };
   }
 
   const { data: inserted, error } = await supabase
@@ -230,11 +275,16 @@ export async function setOccurrenceStatus(
       status,
       origin: "recurring",
       duration_minutes: duration,
-      amount_cents: amount,
+      amount_cents: postedFee(status, block, null),
     })
     .select("id")
     .single();
   revalidatePath("/dashboard", "layout");
+  if (error && isUniqueViolation(error)) {
+    // Someone materialised this occurrence in between (double-tap / second
+    // tab). Nothing was written; the refreshed calendar shows the truth.
+    return { ok: false, lessonId: null, prev: null };
+  }
   return {
     ok: !error,
     lessonId: (inserted as unknown as { id: string } | null)?.id ?? null,
@@ -252,30 +302,39 @@ export async function restoreOccurrence(
   const supabase = await SB();
 
   if (prev === null) {
-    const { error } = await supabase.from("lessons").delete().eq("id", lessonId);
+    const { data: deleted, error } = await supabase
+      .from("lessons")
+      .delete()
+      .eq("id", lessonId)
+      .select("id");
     revalidatePath("/dashboard", "layout");
-    return { ok: !error };
+    return { ok: !error && (deleted ?? []).length > 0 };
   }
   const { data } = await supabase
     .from("lessons")
-    .select("duration_minutes, enrollment:enrollments(hourly_rate_cents)")
+    .select(
+      "duration_minutes, fee_override_cents, enrollment:enrollments(hourly_rate_cents)",
+    )
     .eq("id", lessonId)
     .single();
   const row = data as unknown as {
     duration_minutes: number;
+    fee_override_cents: number | null;
     enrollment: { hourly_rate_cents: number } | null;
   } | null;
   if (!row) return { ok: false };
-  const amount = feeForStatus(
+  const amount = postedFee(
     prev,
     blockAmountCents(row.duration_minutes, row.enrollment?.hourly_rate_cents ?? 0),
+    row.fee_override_cents,
   );
-  const { error } = await supabase
+  const { data: updated, error } = await supabase
     .from("lessons")
     .update({ status: prev, amount_cents: amount })
-    .eq("id", lessonId);
+    .eq("id", lessonId)
+    .select("id");
   revalidatePath("/dashboard", "layout");
-  return { ok: !error };
+  return { ok: !error && (updated ?? []).length > 0 };
 }
 
 /**
@@ -294,14 +353,15 @@ export async function setOccurrenceNote(
   if (!lessonId) {
     const enr = await getEnrollment(supabase, ref.enrollmentId);
     if (!enr) return { ok: false, lessonId: null };
-    const { data: inserted } = await supabase
+    const startsAt = sydneyWallToUtc(ref.date, ref.startTime).toISOString();
+    const { data: inserted, error } = await supabase
       .from("lessons")
       .insert({
         tenant_id: enr.tenant_id,
         student_id: enr.student_id,
         enrollment_id: ref.enrollmentId,
         date: ref.date,
-        starts_at: sydneyWallToUtc(ref.date, ref.startTime).toISOString(),
+        starts_at: startsAt,
         status: "scheduled",
         origin: "recurring",
         duration_minutes:
@@ -311,6 +371,20 @@ export async function setOccurrenceNote(
       .select("id")
       .single();
     lessonId = (inserted as unknown as { id: string } | null)?.id ?? null;
+    if (!lessonId && isUniqueViolation(error)) {
+      // The occurrence was materialised in between — attach the note to the
+      // existing row instead of failing.
+      const { data: existing } = await supabase
+        .from("lessons")
+        .select("id")
+        .eq("enrollment_id", ref.enrollmentId)
+        .eq("date", ref.date)
+        .eq("starts_at", startsAt)
+        .eq("origin", "recurring")
+        .limit(1);
+      lessonId =
+        (existing as unknown as { id: string }[] | null)?.[0]?.id ?? null;
+    }
   }
   if (!lessonId) return { ok: false, lessonId: null };
 
@@ -328,6 +402,9 @@ export interface RescheduleUndo {
   originalId: string;
   originalWasVirtual: boolean;
   makeupId: string;
+  /** True prior state of the original, so undo restores exactly what was there. */
+  prevStatus: LessonStatus;
+  prevAmount: number;
 }
 
 /**
@@ -335,6 +412,11 @@ export interface RescheduleUndo {
  * linked) and create a one-off MAKEUP at the new datetime inheriting the
  * enrollment's rate/duration. The recurrence rule is untouched; billing nets ONE
  * session (original $0 + makeup, which bills only once marked attended).
+ *
+ * Runs in ONE transaction via the reschedule_occurrence RPC (policies.sql
+ * §11g), which also guards re-entry: an original that is already marked or
+ * already rescheduled is rejected, so a double-tap can never mint a second
+ * makeup (the "nets exactly ONE billed session" invariant, doc 26 §2B).
  */
 export async function rescheduleOccurrence(input: {
   lessonId: string | null;
@@ -358,81 +440,64 @@ export async function rescheduleOccurrence(input: {
       ? Math.round(input.durationMinutes)
       : enr.session_minutes;
 
-  // 1. Ensure the original is persisted and struck.
-  let originalId = input.lessonId;
-  let originalWasVirtual = false;
-  if (originalId) {
-    await supabase
-      .from("lessons")
-      .update({ status: "rescheduled", amount_cents: 0 })
-      .eq("id", originalId);
-  } else {
-    originalWasVirtual = true;
-    const { data: struck, error } = await supabase
-      .from("lessons")
-      .insert({
-        tenant_id: enr.tenant_id,
-        student_id: enr.student_id,
-        enrollment_id: input.enrollmentId,
-        date: input.date,
-        starts_at: sydneyWallToUtc(input.date, input.startTime).toISOString(),
-        status: "rescheduled",
-        origin: "recurring",
-        duration_minutes: duration,
-        amount_cents: 0,
-      })
-      .select("id")
-      .single();
-    if (error) return { ok: false, error: "Couldn't strike the original." };
-    originalId = (struck as unknown as { id: string }).id;
-  }
-
-  // 2. Create the one-off makeup (scheduled → bills only when marked attended).
-  const { data: makeup, error: mkErr } = await supabase
-    .from("lessons")
-    .insert({
-      tenant_id: enr.tenant_id,
-      student_id: enr.student_id,
-      enrollment_id: input.enrollmentId,
-      date: input.newDate,
-      starts_at: sydneyWallToUtc(input.newDate, input.newStartTime).toISOString(),
-      status: "scheduled",
-      origin: "makeup",
-      duration_minutes: duration,
-      amount_cents: 0,
-    })
-    .select("id")
-    .single();
-  if (mkErr) return { ok: false, error: "Couldn't create the makeup." };
-  const makeupId = (makeup as unknown as { id: string }).id;
-
-  // 3. Link original → makeup.
-  await supabase
-    .from("lessons")
-    .update({ rescheduled_to_lesson_id: makeupId })
-    .eq("id", originalId!);
-
+  const { data, error } = await supabase.rpc("reschedule_occurrence", {
+    p_lesson_id: input.lessonId,
+    p_enrollment_id: input.enrollmentId,
+    p_date: input.date,
+    p_starts_at: sydneyWallToUtc(input.date, input.startTime).toISOString(),
+    p_duration_minutes: duration,
+    p_new_date: input.newDate,
+    p_new_starts_at: sydneyWallToUtc(
+      input.newDate,
+      input.newStartTime,
+    ).toISOString(),
+  });
   revalidatePath("/dashboard", "layout");
+  if (error) return { ok: false, error: "Couldn't reschedule." };
+  const res = data as unknown as {
+    ok: boolean;
+    error?: string;
+    original_id?: string;
+    original_was_virtual?: boolean;
+    makeup_id?: string;
+    prev_status?: LessonStatus;
+    prev_amount?: number;
+  };
+  if (!res?.ok) return { ok: false, error: res?.error ?? "Couldn't reschedule." };
   return {
     ok: true,
-    undo: { originalId: originalId!, originalWasVirtual, makeupId },
+    undo: {
+      originalId: res.original_id!,
+      originalWasVirtual: res.original_was_virtual ?? false,
+      makeupId: res.makeup_id!,
+      prevStatus: res.prev_status ?? "scheduled",
+      prevAmount: res.prev_amount ?? 0,
+    },
   };
 }
 
-/** Undo a reschedule: remove the makeup + un-strike (or delete) the original. */
-export async function undoReschedule(u: RescheduleUndo): Promise<{ ok: boolean }> {
-  if (!(await requireStaff())) return { ok: false };
+/**
+ * Undo a reschedule: remove the makeup + restore the original to its TRUE prior
+ * state (prevStatus/prevAmount — never a blind reset to `scheduled`). One
+ * transaction via the undo_reschedule RPC; refuses if the makeup was already
+ * marked (undo that mark first).
+ */
+export async function undoReschedule(
+  u: RescheduleUndo,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!(await requireStaff())) return { ok: false, error: "Not allowed." };
   const supabase = await SB();
-  await supabase.from("lessons").delete().eq("id", u.makeupId);
-  if (u.originalWasVirtual) {
-    await supabase.from("lessons").delete().eq("id", u.originalId);
-  } else {
-    await supabase
-      .from("lessons")
-      .update({ status: "scheduled", amount_cents: 0, rescheduled_to_lesson_id: null })
-      .eq("id", u.originalId);
-  }
+  const { data, error } = await supabase.rpc("undo_reschedule", {
+    p_original_id: u.originalId,
+    p_makeup_id: u.makeupId,
+    p_original_was_virtual: u.originalWasVirtual,
+    p_prev_status: u.prevStatus,
+    p_prev_amount: u.prevAmount,
+  });
   revalidatePath("/dashboard", "layout");
+  if (error) return { ok: false, error: "Couldn't undo." };
+  const res = data as unknown as { ok: boolean; error?: string };
+  if (!res?.ok) return { ok: false, error: res?.error ?? "Couldn't undo." };
   return { ok: true };
 }
 
@@ -480,12 +545,13 @@ export async function endSchedule(scheduleId: string): Promise<{ ok: boolean }> 
   if (!(await requireStaff())) return { ok: false };
   if (!scheduleId) return { ok: false };
   const supabase = await SB();
-  const { error } = await supabase
+  const { data: updated, error } = await supabase
     .from("enrollment_schedules")
     .update({ effective_to: sydneyNow().date })
-    .eq("id", scheduleId);
+    .eq("id", scheduleId)
+    .select("id");
   revalidatePath("/dashboard", "layout");
-  return { ok: !error };
+  return { ok: !error && (updated ?? []).length > 0 };
 }
 
 /** Hard-delete a slot (added by mistake). Use endSchedule to preserve history. */
@@ -493,10 +559,11 @@ export async function deleteSchedule(scheduleId: string): Promise<{ ok: boolean 
   if (!(await requireStaff())) return { ok: false };
   if (!scheduleId) return { ok: false };
   const supabase = await SB();
-  const { error } = await supabase
+  const { data: deleted, error } = await supabase
     .from("enrollment_schedules")
     .delete()
-    .eq("id", scheduleId);
+    .eq("id", scheduleId)
+    .select("id");
   revalidatePath("/dashboard", "layout");
-  return { ok: !error };
+  return { ok: !error && (deleted ?? []).length > 0 };
 }

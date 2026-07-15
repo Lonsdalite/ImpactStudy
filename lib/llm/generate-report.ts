@@ -52,7 +52,12 @@ export async function generateWeeklyReport(input: {
     `Attended ${stats.attended} of ${stats.totalScheduled} scheduled sessions (on time: ${stats.present}, late: ${stats.late}, absent: ${stats.absent}).`,
   );
   if (stats.streak >= 2) {
-    facts.push(`Current attendance streak: ${stats.streak} sessions in a row.`);
+    // Lifetime attended count — misses don't break it, so it is NOT a
+    // consecutive run. The fact sheet must never claim "in a row" (the model
+    // would faithfully repeat the falsehood — anti-fabrication cuts both ways).
+    facts.push(
+      `Attendance so far: ${stats.streak} sessions attended and counting (all-time).`,
+    );
   }
   if (stats.attendedSessions.length > 0) {
     facts.push(

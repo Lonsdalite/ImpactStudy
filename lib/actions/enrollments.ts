@@ -3,6 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { createClient } from "@/lib/supabase/server";
 import { resolveActiveTenant } from "@/lib/tenant";
+import { todaySydney } from "@/lib/billing";
 import type { EnrollmentMode } from "@/lib/db/schema";
 
 /**
@@ -38,10 +39,13 @@ export async function createEnrollment(input: {
 
   const supabase = await createClient();
 
+  // The student must be in the ACTIVE tenant — never let a studentId pick its
+  // own tenant (doc 06 §6 in-code tenant scoping).
   const { data: studentRow } = await supabase
     .from("students")
     .select("tenant_id, year_level")
     .eq("id", input.studentId)
+    .eq("tenant_id", tenant.tenantId)
     .single();
   const student = studentRow as unknown as {
     tenant_id: string;
@@ -108,18 +112,21 @@ export async function createEnrollment(input: {
   return { ok: true };
 }
 
-/** Deactivate / reactivate an enrollment. History (lessons) is preserved. */
+/** Deactivate / reactivate an enrollment. History (lessons) is preserved.
+ *  end_date is Sydney "today" — UTC was off by one for Sydney evenings. */
 export async function setEnrollmentActive(
   enrollmentId: string,
   active: boolean,
 ): Promise<{ ok: boolean }> {
-  if (!(await requireStaff())) return { ok: false };
-  if (!enrollmentId) return { ok: false };
+  const tenant = await requireStaff();
+  if (!tenant || !enrollmentId) return { ok: false };
   const supabase = await createClient();
-  const { error } = await supabase
+  const { data: updated, error } = await supabase
     .from("enrollments")
-    .update({ active, end_date: active ? null : new Date().toISOString().slice(0, 10) })
-    .eq("id", enrollmentId);
+    .update({ active, end_date: active ? null : todaySydney() })
+    .eq("id", enrollmentId)
+    .eq("tenant_id", tenant.tenantId)
+    .select("id");
   revalidatePath("/dashboard", "layout");
-  return { ok: !error };
+  return { ok: !error && (updated ?? []).length > 0 };
 }

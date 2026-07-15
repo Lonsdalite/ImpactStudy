@@ -14,8 +14,6 @@ import {
 import {
   addSession,
   deleteLesson,
-  deleteLessons,
-  markAllPresent,
   markAttendance,
   restoreLesson,
   setLessonNote,
@@ -133,39 +131,19 @@ export function AttendanceRegister({
     });
   }
 
-  function markAll() {
-    startTransition(async () => {
-      const res = await markAllPresent(date);
-      if (res.count > 0) {
-        const ids = res.lessonIds;
-        toast.success(`Marked ${res.count} present — adjust any exceptions`, {
-          action: {
-            label: "Undo all",
-            onClick: () =>
-              startTransition(async () => {
-                await deleteLessons(ids);
-                router.refresh();
-              }),
-          },
-        });
-      } else {
-        toast.success("Everyone's already marked");
-      }
-      router.refresh();
-    });
-  }
+  // Bulk "Mark all present" retired in Slice B.5 — the Calendar's mark-day /
+  // mark-week is the one bulk engine (schedule-aware, future-guarded, batch
+  // undo). This register stays for per-enrollment exceptions and extra sessions.
 
   return (
     <div>
       <div className="mt-5 flex items-center justify-between">
-        <button
-          type="button"
-          onClick={markAll}
-          disabled={isPending || enrollments.length === 0}
-          className="rounded-lg bg-brand-sage/15 px-4 py-2 text-sm font-medium text-brand-plum transition-colors hover:bg-brand-sage/25 disabled:opacity-50"
+        <Link
+          href="/dashboard/calendar"
+          className="rounded-lg bg-brand-sage/15 px-4 py-2 text-sm font-medium text-brand-plum transition-colors hover:bg-brand-sage/25"
         >
-          Mark all present
-        </button>
+          Bulk-mark on the Calendar →
+        </Link>
         <span className="text-xs text-brand-ink/55">
           {markedCount} of {enrollments.length} marked
         </span>

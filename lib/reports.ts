@@ -1,5 +1,6 @@
 import type { LessonStatus } from "@/lib/db/schema";
 import { todaySydney } from "@/lib/billing";
+import { weekStart } from "@/lib/calendar";
 
 /**
  * Parent-heartbeat report helpers. Pure functions (no "server-only") so both the
@@ -30,31 +31,25 @@ export interface WeeklyStats {
   attendedSessions: { date: string; status: LessonStatus; note: string | null }[];
   /** Free-text notes left on this week's lessons, newest first. */
   notes: { date: string; note: string }[];
-  /** Consecutive attended sessions ending at the most recent session (all-time). */
+  /**
+   * All-time count of attended sessions (attended + late). NOT a consecutive
+   * run — misses skip without breaking it (doc 26 §2B), so the copy says
+   * "N sessions and counting", never "in a row".
+   */
   streak: number;
 }
 
-const DAY_MS = 86_400_000;
-
-function isoToUTC(iso: string): Date {
-  const [y, m, d] = iso.split("-").map(Number);
-  return new Date(Date.UTC(y, m - 1, d));
-}
-function utcToIso(dt: Date): string {
-  return dt.toISOString().slice(0, 10);
-}
-
 /**
- * The reporting window: the `days`-day span ending today (Sydney), inclusive.
- * Default 7 = "this week". end is always today so the note reads as current.
+ * The reporting window: MONDAY of the week containing `todayIso` (Sydney)
+ * through today, inclusive. Anchored to weekStart (Slice B.5) so the
+ * unique(student_id, period_start) dedupe key is stable no matter which
+ * weekday drafts run — the Friday cron and a mid-week manual "Draft this
+ * week's notes" now hit the SAME row instead of minting an overlapping note.
  */
 export function reportWindow(
   todayIso: string = todaySydney(),
-  days = 7,
 ): { start: string; end: string } {
-  const end = isoToUTC(todayIso);
-  const start = new Date(end.getTime() - (days - 1) * DAY_MS);
-  return { start: utcToIso(start), end: todayIso };
+  return { start: weekStart(todayIso), end: todayIso };
 }
 
 const ATTENDED: LessonStatus[] = ["attended", "late"];
@@ -67,9 +62,8 @@ const ATTENDED: LessonStatus[] = ["attended", "late"];
 export function weeklyStats(
   allLessons: ReportLesson[],
   todayIso: string = todaySydney(),
-  days = 7,
 ): WeeklyStats {
-  const { start, end } = reportWindow(todayIso, days);
+  const { start, end } = reportWindow(todayIso);
 
   const inWindow = allLessons.filter((l) => l.date >= start && l.date <= end);
 
@@ -98,15 +92,17 @@ export function weeklyStats(
     .sort((a, b) => (a.date < b.date ? 1 : -1))
     .map((l) => ({ date: l.date, note: (l.note as string).trim() }));
 
-  // All-time attended streak (doc 26 §2B): count attended/late sessions. A plain
-  // missed session (absent/cancelled) is NOT counted but does NOT reset the streak
-  // — this avoids punishing a legit holiday/sick week (protects the warmth thesis).
-  // A `rescheduled` original is skipped too: its streak is carried by the makeup
-  // lesson (which appears as its own attended row once marked). `scheduled`
-  // (unresolved) rows are ignored. Net effect: misses never break the run.
-  const chronological = [...allLessons].sort((a, b) => (a.date < b.date ? 1 : -1));
+  // All-time attended count (doc 26 §2B): attended/late sessions. A plain
+  // missed session (absent/cancelled) is NOT counted but does NOT reset it —
+  // this avoids punishing a legit holiday/sick week (protects the warmth
+  // thesis). A `rescheduled` original is skipped too: its credit is carried by
+  // the makeup lesson (which appears as its own attended row once marked).
+  // Because misses never break it, this is a lifetime count, not a consecutive
+  // run — the copy must never claim "in a row" (it lives in the "computed,
+  // never wrong" layer, doc 20 §7.1). A true consecutive metric is a possible
+  // later product decision (doc 35c Bucket C).
   let streak = 0;
-  for (const l of chronological) {
+  for (const l of allLessons) {
     if (ATTENDED.includes(l.status)) streak++;
     // absent / cancelled / rescheduled / scheduled → skip, never break.
   }
@@ -136,7 +132,9 @@ export function microWin(stats: WeeklyStats, firstName: string): string {
     return `No sessions for ${firstName} this week yet.`;
   }
   const sessionWord = stats.attended === 1 ? "session" : "sessions";
+  // "N sessions and counting" — truthful (streak = lifetime attended count;
+  // misses don't break it, so it is NOT a consecutive run — never say "in a row").
   const streakBit =
-    stats.streak >= 3 ? ` ${stats.streak} in a row now.` : "";
+    stats.streak >= 3 ? ` ${stats.streak} sessions and counting.` : "";
   return `${firstName} showed up to ${stats.attended} ${sessionWord} this week.${streakBit}`;
 }

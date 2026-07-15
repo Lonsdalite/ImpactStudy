@@ -11,6 +11,7 @@ import {
   index,
   unique,
   check,
+  foreignKey,
   type AnyPgColumn,
 } from "drizzle-orm/pg-core";
 import { relations, sql } from "drizzle-orm";
@@ -139,6 +140,10 @@ export const memberships = pgTable(
 
 // ---------- students ----------
 // Belong to a tenant. Linked to one or more parent users via student_parents.
+// unique(tenant_id, id) is the anchor for the COMPOSITE tenant-coherence FKs
+// (Slice B.5, Fable review P0-1): every child table references
+// (tenant_id, student_id) → students(tenant_id, id), which makes a cross-tenant
+// row (tenant B pointing at tenant A's student) unrepresentable in the DB.
 export const students = pgTable(
   "students",
   {
@@ -160,7 +165,10 @@ export const students = pgTable(
       .defaultNow()
       .notNull(),
   },
-  (t) => [index("students_tenant_idx").on(t.tenantId)],
+  (t) => [
+    index("students_tenant_idx").on(t.tenantId),
+    unique("students_tenant_id_id_unique").on(t.tenantId, t.id),
+  ],
 );
 
 // ---------- student_parents ----------
@@ -173,9 +181,7 @@ export const studentParents = pgTable(
     tenantId: uuid("tenant_id")
       .notNull()
       .references(() => tenants.id, { onDelete: "cascade" }),
-    studentId: uuid("student_id")
-      .notNull()
-      .references(() => students.id, { onDelete: "cascade" }),
+    studentId: uuid("student_id").notNull(),
     parentUserId: uuid("parent_user_id")
       .notNull()
       .references(() => users.id, { onDelete: "cascade" }),
@@ -185,6 +191,13 @@ export const studentParents = pgTable(
   (t) => [
     unique("student_parents_unique").on(t.studentId, t.parentUserId),
     index("student_parents_tenant_idx").on(t.tenantId),
+    // Tenant-coherent link: the row's tenant MUST be the student's tenant, so a
+    // forged cross-tenant parent link is unrepresentable (Fable P0-1).
+    foreignKey({
+      name: "student_parents_tenant_student_fk",
+      columns: [t.tenantId, t.studentId],
+      foreignColumns: [students.tenantId, students.id],
+    }).onDelete("cascade"),
   ],
 );
 
@@ -261,9 +274,7 @@ export const enrollments = pgTable(
     tenantId: uuid("tenant_id")
       .notNull()
       .references(() => tenants.id, { onDelete: "cascade" }),
-    studentId: uuid("student_id")
-      .notNull()
-      .references(() => students.id, { onDelete: "cascade" }),
+    studentId: uuid("student_id").notNull(),
     subjectId: uuid("subject_id")
       .notNull()
       .references(() => subjects.id, { onDelete: "cascade" }),
@@ -292,6 +303,13 @@ export const enrollments = pgTable(
     index("enrollments_tenant_idx").on(t.tenantId),
     index("enrollments_student_idx").on(t.studentId),
     index("enrollments_subject_idx").on(t.subjectId),
+    // Anchor for tenant-coherent composite FKs from child tables (Fable P0-1).
+    unique("enrollments_tenant_id_id_unique").on(t.tenantId, t.id),
+    foreignKey({
+      name: "enrollments_tenant_student_fk",
+      columns: [t.tenantId, t.studentId],
+      foreignColumns: [students.tenantId, students.id],
+    }).onDelete("cascade"),
   ],
 );
 
@@ -416,14 +434,15 @@ export const lessons = pgTable(
     tenantId: uuid("tenant_id")
       .notNull()
       .references(() => tenants.id, { onDelete: "cascade" }),
-    studentId: uuid("student_id")
-      .notNull()
-      .references(() => students.id, { onDelete: "cascade" }),
+    studentId: uuid("student_id").notNull(),
     // The enrollment this block belongs to (rate + subject resolve via it).
     // Nullable only to survive a legacy/bare one-off; normal marks always set it.
-    enrollmentId: uuid("enrollment_id").references(() => enrollments.id, {
-      onDelete: "cascade",
-    }),
+    // FK lives in the migration SQL, not here: it's a tenant-coherent composite
+    // (tenant_id, enrollment_id) → enrollments(tenant_id, id) with
+    // ON DELETE SET NULL (enrollment_id) — the PG15 column-list form Drizzle
+    // can't express. SET NULL (not cascade): deleting an enrollment must never
+    // delete its billed history (the ledger).
+    enrollmentId: uuid("enrollment_id"),
     date: date("date").notNull(), // 'YYYY-MM-DD' (the lesson day, Sydney)
     // The occurrence datetime (date + slot start_time, Sydney wall clock). Slice B
     // renders the calendar off this; `date` remains the billing/reporting day key.
@@ -455,12 +474,21 @@ export const lessons = pgTable(
   },
   (t) => [
     // No unique(student_id, date): a student may have several lessons a day
-    // (different enrollments or a double session). Occurrence identity is
-    // (enrollment_id, date) for a recurring slot; makeups/one-offs are keyed by id.
+    // (different enrollments or a double session). Occurrence identity for a
+    // RECURRING slot is (enrollment_id, date, starts_at) — enforced by a partial
+    // unique index in the migration SQL (NULLS NOT DISTINCT, WHERE
+    // origin='recurring'; Drizzle can't express either), so a double-tap on
+    // "Mark this week" can never double-bill (Fable P0-2). Makeups/one-offs are
+    // keyed by id and exempt (origin <> 'recurring').
     index("lessons_tenant_idx").on(t.tenantId),
     index("lessons_student_idx").on(t.studentId),
     index("lessons_enrollment_idx").on(t.enrollmentId),
     index("lessons_date_idx").on(t.date),
+    foreignKey({
+      name: "lessons_tenant_student_fk",
+      columns: [t.tenantId, t.studentId],
+      foreignColumns: [students.tenantId, students.id],
+    }).onDelete("cascade"),
   ],
 );
 
@@ -481,9 +509,7 @@ export const enrollmentSchedules = pgTable(
     tenantId: uuid("tenant_id")
       .notNull()
       .references(() => tenants.id, { onDelete: "cascade" }),
-    enrollmentId: uuid("enrollment_id")
-      .notNull()
-      .references(() => enrollments.id, { onDelete: "cascade" }),
+    enrollmentId: uuid("enrollment_id").notNull(),
     weekday: integer("weekday").notNull(), // 0=Sun .. 6=Sat
     startTime: text("start_time").notNull(), // 'HH:MM'
     durationOverride: integer("duration_override"), // null = inherit enrollment
@@ -501,6 +527,11 @@ export const enrollmentSchedules = pgTable(
       "enrollment_schedules_weekday_ck",
       sql`${t.weekday} >= 0 AND ${t.weekday} <= 6`,
     ),
+    foreignKey({
+      name: "enrollment_schedules_tenant_enrollment_fk",
+      columns: [t.tenantId, t.enrollmentId],
+      foreignColumns: [enrollments.tenantId, enrollments.id],
+    }).onDelete("cascade"),
   ],
 );
 
@@ -523,9 +554,7 @@ export const payments = pgTable(
     tenantId: uuid("tenant_id")
       .notNull()
       .references(() => tenants.id, { onDelete: "cascade" }),
-    studentId: uuid("student_id")
-      .notNull()
-      .references(() => students.id, { onDelete: "cascade" }),
+    studentId: uuid("student_id").notNull(),
     amountCents: integer("amount_cents").notNull(),
     method: paymentMethodEnum("method").notNull(),
     paidOn: date("paid_on").notNull(), // 'YYYY-MM-DD'
@@ -538,14 +567,20 @@ export const payments = pgTable(
     index("payments_tenant_idx").on(t.tenantId),
     index("payments_student_idx").on(t.studentId),
     index("payments_paid_on_idx").on(t.paidOn),
+    foreignKey({
+      name: "payments_tenant_student_fk",
+      columns: [t.tenantId, t.studentId],
+      foreignColumns: [students.tenantId, students.id],
+    }).onDelete("cascade"),
   ],
 );
 
 // ---------- reports (parent heartbeat) ----------
 // One persisted weekly progress note per student per billing-agnostic weekly
 // period. Lifecycle: draft (AI-written, tutor-only) -> approved (tutor signed
-// off) -> sent (delivered to parent). A parent may ONLY ever see approved/sent
-// rows (enforced in RLS, not just the UI). The voice output is split into
+// off) -> sent (delivered to parent). A parent may ONLY ever see a SENT row —
+// drafts AND approved-but-unsent notes stay tutor-only (enforced in RLS, not
+// just the UI; sendReport also only accepts an approved note). The voice output is split into
 // greeting/body/signoff so "Copy note" and email render identically; `stats` is
 // the snapshot of facts the note was written from (audit + anti-fabrication).
 // See 20_Product_UX_and_Moat.md §7.
@@ -562,9 +597,7 @@ export const reports = pgTable(
     tenantId: uuid("tenant_id")
       .notNull()
       .references(() => tenants.id, { onDelete: "cascade" }),
-    studentId: uuid("student_id")
-      .notNull()
-      .references(() => students.id, { onDelete: "cascade" }),
+    studentId: uuid("student_id").notNull(),
     // Inclusive weekly window the note covers (YYYY-MM-DD).
     periodStart: date("period_start").notNull(),
     periodEnd: date("period_end").notNull(),
@@ -592,6 +625,11 @@ export const reports = pgTable(
     index("reports_tenant_idx").on(t.tenantId),
     index("reports_student_idx").on(t.studentId),
     index("reports_status_idx").on(t.status),
+    foreignKey({
+      name: "reports_tenant_student_fk",
+      columns: [t.tenantId, t.studentId],
+      foreignColumns: [students.tenantId, students.id],
+    }).onDelete("cascade"),
   ],
 );
 
@@ -645,15 +683,13 @@ export const assignments = pgTable(
     tenantId: uuid("tenant_id")
       .notNull()
       .references(() => tenants.id, { onDelete: "cascade" }),
-    studentId: uuid("student_id")
-      .notNull()
-      .references(() => students.id, { onDelete: "cascade" }),
+    studentId: uuid("student_id").notNull(),
     // Optional context — which enrollment/subject this belongs to (for filtering
     // + the future diligence→report join). Nullable so a quick assignment needs
-    // no enrollment.
-    enrollmentId: uuid("enrollment_id").references(() => enrollments.id, {
-      onDelete: "set null",
-    }),
+    // no enrollment. FK is the tenant-coherent composite in the migration SQL:
+    // (tenant_id, enrollment_id) → enrollments(tenant_id, id)
+    // ON DELETE SET NULL (enrollment_id) — PG15 column-list form.
+    enrollmentId: uuid("enrollment_id"),
     subjectId: uuid("subject_id").references(() => subjects.id, {
       onDelete: "set null",
     }),
@@ -677,6 +713,11 @@ export const assignments = pgTable(
     index("assignments_tenant_idx").on(t.tenantId),
     index("assignments_student_idx").on(t.studentId),
     index("assignments_status_idx").on(t.status),
+    foreignKey({
+      name: "assignments_tenant_student_fk",
+      columns: [t.tenantId, t.studentId],
+      foreignColumns: [students.tenantId, students.id],
+    }).onDelete("cascade"),
   ],
 );
 
@@ -693,9 +734,7 @@ export const submissions = pgTable(
     tenantId: uuid("tenant_id")
       .notNull()
       .references(() => tenants.id, { onDelete: "cascade" }),
-    studentId: uuid("student_id")
-      .notNull()
-      .references(() => students.id, { onDelete: "cascade" }),
+    studentId: uuid("student_id").notNull(),
     // Optional link to an assignment; null = standalone (notebook-photo path).
     assignmentId: uuid("assignment_id").references(() => assignments.id, {
       onDelete: "set null",
@@ -722,6 +761,13 @@ export const submissions = pgTable(
     index("submissions_tenant_idx").on(t.tenantId),
     index("submissions_student_idx").on(t.studentId),
     index("submissions_assignment_idx").on(t.assignmentId),
+    // Anchor for corrections' tenant-coherent composite FK (Fable P0-1).
+    unique("submissions_tenant_id_id_unique").on(t.tenantId, t.id),
+    foreignKey({
+      name: "submissions_tenant_student_fk",
+      columns: [t.tenantId, t.studentId],
+      foreignColumns: [students.tenantId, students.id],
+    }).onDelete("cascade"),
   ],
 );
 
@@ -737,12 +783,8 @@ export const corrections = pgTable(
     tenantId: uuid("tenant_id")
       .notNull()
       .references(() => tenants.id, { onDelete: "cascade" }),
-    submissionId: uuid("submission_id")
-      .notNull()
-      .references(() => submissions.id, { onDelete: "cascade" }),
-    studentId: uuid("student_id")
-      .notNull()
-      .references(() => students.id, { onDelete: "cascade" }),
+    submissionId: uuid("submission_id").notNull(),
+    studentId: uuid("student_id").notNull(),
     status: correctionStatusEnum("status").default("draft").notNull(),
     // Per-question verdicts (right/wrong/partial + comment). Editable pre-release.
     items: jsonb("items").$type<CorrectionItem[]>().default([]).notNull(),
@@ -767,6 +809,16 @@ export const corrections = pgTable(
     index("corrections_tenant_idx").on(t.tenantId),
     index("corrections_student_idx").on(t.studentId),
     index("corrections_status_idx").on(t.status),
+    foreignKey({
+      name: "corrections_tenant_student_fk",
+      columns: [t.tenantId, t.studentId],
+      foreignColumns: [students.tenantId, students.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "corrections_tenant_submission_fk",
+      columns: [t.tenantId, t.submissionId],
+      foreignColumns: [submissions.tenantId, submissions.id],
+    }).onDelete("cascade"),
   ],
 );
 

@@ -51,8 +51,10 @@ export default async function StudentsPage({
   const balance = new Map<string, { outstanding: number; due: string }>();
   if (isParent && students.length > 0) {
     const ids = students.map((s) => s.id);
+    // parent_lessons = the column-safe parent view (the base lessons table is
+    // staff-only in RLS since Slice B.5).
     const [{ data: lessonData }, { data: payData }] = await Promise.all([
-      supabase.from("lessons").select("student_id, amount_cents").in("student_id", ids),
+      supabase.from("parent_lessons").select("student_id, amount_cents").in("student_id", ids),
       supabase.from("payments").select("student_id, amount_cents").in("student_id", ids),
     ]);
     const billed = new Map<string, number>();

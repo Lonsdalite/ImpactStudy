@@ -6,17 +6,21 @@
 --
 -- IDEMPOTENT: safe to re-run. Every object is dropped-if-exists then recreated.
 --
--- ⚠️  CRITICAL: `drizzle-kit push` DISABLES RLS on every table (it reconciles the
---     DB to the Drizzle schema, which doesn't declare RLS). So ALWAYS re-run this
---     after a push. `pnpm db:push` is chained to do it automatically; if you ever
---     run `db:push:only` (raw), follow it with `pnpm db:policies`. A parent
---     seeing students who aren't their children = RLS got disabled; re-run this.
+-- ⚠️  SCHEMA CHANGES GO THROUGH MIGRATIONS (Slice B.5): `drizzle-kit generate`
+--     → `pnpm db:migrate`. Migrations never touch RLS. `db:push` is GONE from
+--     package.json — it silently DISABLED RLS on every table (it reconciles the
+--     DB to the Drizzle schema, which doesn't declare RLS), which was one
+--     forgotten chain away from a fully open database. `pnpm db:migrate` is
+--     chained to re-apply this file and then ASSERT rowsecurity is ON for every
+--     public table — it fails loudly otherwise.
 --
 -- HOW TO APPLY (pick one):
---   1. Supabase dashboard -> SQL Editor -> paste this whole file -> Run.
---   2. psql "$DIRECT_URL" -f lib/db/policies.sql
+--   1. pnpm db:policies (tsx lib/db/apply-policies.ts — includes the RLS-on
+--      assertion).
+--   2. Supabase dashboard -> SQL Editor -> paste this whole file -> Run.
+--   3. psql "$DIRECT_URL" -f lib/db/policies.sql
 --      (DIRECT_URL = session-mode pooler, port 5432 — NOT the 6543 runtime URL.
---       Run db:push FIRST so the corpus tables exist before we policy them.)
+--       Run db:migrate FIRST so the tables exist before we policy them.)
 --
 -- TWO DATA PATHS — READ THIS:
 --   * supabase-js with the PUBLISHABLE key talks to PostgREST as the
@@ -189,6 +193,9 @@ create policy memberships_select_self_or_staff on public.memberships
 -- ----------------------------------------------------------------------------
 -- 7. Policies — students (staff tenant-wide; parents only their own children)
 -- ----------------------------------------------------------------------------
+-- Parent predicates everywhere carry `sp.tenant_id = <table>.tenant_id`
+-- (Slice B.5 / Fable P0-1): a parent link only grants reads INSIDE the link's
+-- own tenant, so a forged/cross-tenant link row can never widen visibility.
 drop policy if exists students_select_staff_or_parent on public.students;
 create policy students_select_staff_or_parent on public.students
   for select to authenticated
@@ -198,6 +205,7 @@ create policy students_select_staff_or_parent on public.students
       select 1
       from public.student_parents sp
       where sp.student_id = public.students.id
+        and sp.tenant_id = public.students.tenant_id
         and sp.parent_user_id = (select auth.uid())
     )
   );
@@ -229,10 +237,21 @@ create policy student_parents_select_staff_or_self on public.student_parents
     or parent_user_id = (select auth.uid())
   );
 
+-- Insert: staff of the row's tenant, AND the student must belong to that same
+-- tenant (Fable P0-1 — otherwise staff of tenant B could link themselves to a
+-- tenant-A student). The composite FK enforces this too; both layers on purpose.
 drop policy if exists student_parents_insert_staff on public.student_parents;
 create policy student_parents_insert_staff on public.student_parents
   for insert to authenticated
-  with check (public.is_tenant_staff(tenant_id));
+  with check (
+    public.is_tenant_staff(tenant_id)
+    and exists (
+      select 1
+      from public.students s
+      where s.id = student_parents.student_id
+        and s.tenant_id = student_parents.tenant_id
+    )
+  );
 
 drop policy if exists student_parents_update_staff on public.student_parents;
 create policy student_parents_update_staff on public.student_parents
@@ -349,6 +368,7 @@ create policy enrollments_select_staff_or_parent on public.enrollments
       select 1
       from public.student_parents sp
       where sp.student_id = public.enrollments.student_id
+        and sp.tenant_id = public.enrollments.tenant_id
         and sp.parent_user_id = (select auth.uid())
     )
   );
@@ -388,8 +408,11 @@ create policy enrollment_schedules_select_staff_or_parent on public.enrollment_s
     or exists (
       select 1
       from public.enrollments e
-      join public.student_parents sp on sp.student_id = e.student_id
+      join public.student_parents sp
+        on sp.student_id = e.student_id
+       and sp.tenant_id = e.tenant_id
       where e.id = public.enrollment_schedules.enrollment_id
+        and e.tenant_id = public.enrollment_schedules.tenant_id
         and sp.parent_user_id = (select auth.uid())
     )
   );
@@ -417,20 +440,15 @@ alter table public.lessons enable row level security;
 
 grant select, insert, update, delete on public.lessons to authenticated;
 
--- lessons: staff see/manage the whole tenant; a parent sees (read-only) the
--- lessons of their own linked children (their attendance + fee feed).
+-- lessons: STAFF ONLY on the base table (Slice B.5 / Fable §1 P1). The row-level
+-- parent policy used to serve whole rows, which exposed `note` — doc 20 §7.6
+-- says the "what we covered" capture stays internal, never shown to parents.
+-- Parents read their attendance + fee feed via the column-safe
+-- public.parent_lessons view (§11f below).
 drop policy if exists lessons_select_staff_or_parent on public.lessons;
 create policy lessons_select_staff_or_parent on public.lessons
   for select to authenticated
-  using (
-    public.is_tenant_staff(tenant_id)
-    or exists (
-      select 1
-      from public.student_parents sp
-      where sp.student_id = public.lessons.student_id
-        and sp.parent_user_id = (select auth.uid())
-    )
-  );
+  using (public.is_tenant_staff(tenant_id));
 
 drop policy if exists lessons_insert_staff on public.lessons;
 create policy lessons_insert_staff on public.lessons
@@ -464,6 +482,7 @@ create policy payments_select_staff_or_parent on public.payments
       select 1
       from public.student_parents sp
       where sp.student_id = public.payments.student_id
+        and sp.tenant_id = public.payments.tenant_id
         and sp.parent_user_id = (select auth.uid())
     )
   );
@@ -510,6 +529,7 @@ create policy reports_select_staff_or_parent on public.reports
         select 1
         from public.student_parents sp
         where sp.student_id = public.reports.student_id
+          and sp.tenant_id = public.reports.tenant_id
           and sp.parent_user_id = (select auth.uid())
       )
     )
@@ -582,6 +602,7 @@ create policy assignments_select_staff_or_parent on public.assignments
       select 1
       from public.student_parents sp
       where sp.student_id = public.assignments.student_id
+        and sp.tenant_id = public.assignments.tenant_id
         and sp.parent_user_id = (select auth.uid())
     )
   );
@@ -612,6 +633,7 @@ create policy submissions_select_staff_or_parent on public.submissions
       select 1
       from public.student_parents sp
       where sp.student_id = public.submissions.student_id
+        and sp.tenant_id = public.submissions.tenant_id
         and sp.parent_user_id = (select auth.uid())
     )
   );
@@ -632,24 +654,15 @@ create policy submissions_delete_staff on public.submissions
   for delete to authenticated
   using (public.is_tenant_staff(tenant_id));
 
--- corrections: staff full write; a parent may read ONLY a RELEASED correction
--- for their own child (the returned feedback, §2D). Drafts stay tutor-only —
--- enforced here, not just the UI (a parent querying directly can't see a draft).
+-- corrections: STAFF ONLY on the base table (Slice B.5 / Fable §1 P1). The old
+-- released-row parent policy served whole rows — `items` (per-question verdicts)
+-- and `stats` (right/wrong tally) are grades, and doc 26 §2D says parents get
+-- feedback, NEVER grades. Parents read released feedback via the column-safe
+-- public.parent_corrections view (§11f below): voiced_note + released_at only.
 drop policy if exists corrections_select_staff_or_parent on public.corrections;
 create policy corrections_select_staff_or_parent on public.corrections
   for select to authenticated
-  using (
-    public.is_tenant_staff(tenant_id)
-    or (
-      status = 'released'
-      and exists (
-        select 1
-        from public.student_parents sp
-        where sp.student_id = public.corrections.student_id
-          and sp.parent_user_id = (select auth.uid())
-      )
-    )
-  );
+  using (public.is_tenant_staff(tenant_id));
 
 drop policy if exists corrections_insert_staff on public.corrections;
 create policy corrections_insert_staff on public.corrections
@@ -666,6 +679,221 @@ drop policy if exists corrections_delete_staff on public.corrections;
 create policy corrections_delete_staff on public.corrections
   for delete to authenticated
   using (public.is_tenant_staff(tenant_id));
+
+-- ----------------------------------------------------------------------------
+-- 11f. PARENT-SAFE VIEWS (Slice B.5 / Fable §1 P1 — "enforced in RLS, not just
+--      the UI", at COLUMN granularity).
+--      RLS is row-level; PostgREST serves whole rows. Since staff and parents
+--      share the `authenticated` role, column safety comes from definer-style
+--      views: the view owner (postgres) bypasses the base tables' RLS, and the
+--      WHERE clause bakes in the parent predicate (tenant-coherent, per P0-1).
+--      security_barrier stops leaky-function pushdown. Base tables stay
+--      staff-only for SELECT (§11 / §11d above).
+--
+--        parent_lessons     : the attendance + fee feed. NO `note` (doc 20
+--                             §7.6 — "what we covered" stays internal), no
+--                             fee_override (billing internals).
+--        parent_corrections : released feedback only. NO `items`, NO `stats`
+--                             (doc 26 §2D — feedback, never grades).
+-- ----------------------------------------------------------------------------
+drop view if exists public.parent_lessons;
+create view public.parent_lessons
+  with (security_barrier)
+  as
+  select
+    l.id,
+    l.tenant_id,
+    l.student_id,
+    l.enrollment_id,
+    l.date,
+    l.starts_at,
+    l.status,
+    l.origin,
+    l.duration_minutes,
+    l.amount_cents
+  from public.lessons l
+  where exists (
+    select 1
+    from public.student_parents sp
+    where sp.student_id = l.student_id
+      and sp.tenant_id = l.tenant_id
+      and sp.parent_user_id = (select auth.uid())
+  );
+
+drop view if exists public.parent_corrections;
+create view public.parent_corrections
+  with (security_barrier)
+  as
+  select
+    c.id,
+    c.tenant_id,
+    c.submission_id,
+    c.student_id,
+    c.voiced_note,
+    c.released_at
+  from public.corrections c
+  where c.status = 'released'
+    and exists (
+      select 1
+      from public.student_parents sp
+      where sp.student_id = c.student_id
+        and sp.tenant_id = c.tenant_id
+        and sp.parent_user_id = (select auth.uid())
+    );
+
+revoke all on public.parent_lessons from public, anon;
+revoke all on public.parent_corrections from public, anon;
+grant select on public.parent_lessons to authenticated;
+grant select on public.parent_corrections to authenticated;
+
+-- ----------------------------------------------------------------------------
+-- 11g. RESCHEDULE RPCs (Slice B.5 / Fable §2 P1 — re-entrancy + atomicity).
+--      strike + makeup + link were three separate PostgREST writes; a failure
+--      mid-way left a struck original with no makeup, and a double-tap created
+--      a second makeup (nets TWO billed sessions — breaks doc 26 §2B).
+--      One SECURITY INVOKER function = one transaction; RLS still applies to
+--      every statement inside (staff-only writes), so this adds no privilege.
+--      Guards: the original must be status='scheduled' AND not already linked;
+--      undo refuses to delete a makeup that has been marked.
+-- ----------------------------------------------------------------------------
+create or replace function public.reschedule_occurrence(
+  p_lesson_id uuid, -- null = the original is still virtual
+  p_enrollment_id uuid,
+  p_date date,
+  p_starts_at timestamptz,
+  p_duration_minutes int,
+  p_new_date date,
+  p_new_starts_at timestamptz
+)
+returns jsonb
+language plpgsql
+set search_path = ''
+as $$
+declare
+  v_enr record;
+  v_original public.lessons%rowtype;
+  v_original_id uuid;
+  v_was_virtual boolean := false;
+  v_prev_status public.lesson_status := 'scheduled';
+  v_prev_amount int := 0;
+  v_makeup_id uuid;
+begin
+  select tenant_id, student_id
+    into v_enr
+    from public.enrollments
+   where id = p_enrollment_id;
+  if not found then
+    return jsonb_build_object('ok', false, 'error', 'Enrollment not found.');
+  end if;
+
+  if p_lesson_id is not null then
+    select * into v_original
+      from public.lessons
+     where id = p_lesson_id
+       for update;
+    if not found then
+      return jsonb_build_object('ok', false, 'error', 'Lesson not found.');
+    end if;
+    -- Re-entrancy guard: only an unresolved, unlinked original can be struck.
+    if v_original.status <> 'scheduled'
+       or v_original.rescheduled_to_lesson_id is not null then
+      return jsonb_build_object(
+        'ok', false,
+        'error', 'This class was already marked or rescheduled. Refresh to see its current state.'
+      );
+    end if;
+    v_original_id := p_lesson_id;
+    v_prev_status := v_original.status;
+    v_prev_amount := v_original.amount_cents;
+  else
+    -- Materialise the virtual original. The partial unique occurrence index
+    -- makes a concurrent touch a unique_violation → caught below, nothing
+    -- half-done.
+    v_was_virtual := true;
+    insert into public.lessons
+      (tenant_id, student_id, enrollment_id, date, starts_at,
+       status, origin, duration_minutes, amount_cents)
+    values
+      (v_enr.tenant_id, v_enr.student_id, p_enrollment_id, p_date, p_starts_at,
+       'scheduled', 'recurring', p_duration_minutes, 0)
+    returning id into v_original_id;
+  end if;
+
+  insert into public.lessons
+    (tenant_id, student_id, enrollment_id, date, starts_at,
+     status, origin, duration_minutes, amount_cents)
+  values
+    (v_enr.tenant_id, v_enr.student_id, p_enrollment_id, p_new_date, p_new_starts_at,
+     'scheduled', 'makeup', p_duration_minutes, 0)
+  returning id into v_makeup_id;
+
+  update public.lessons
+     set status = 'rescheduled',
+         amount_cents = 0,
+         rescheduled_to_lesson_id = v_makeup_id
+   where id = v_original_id;
+
+  return jsonb_build_object(
+    'ok', true,
+    'original_id', v_original_id,
+    'original_was_virtual', v_was_virtual,
+    'makeup_id', v_makeup_id,
+    'prev_status', v_prev_status,
+    'prev_amount', v_prev_amount
+  );
+exception
+  when unique_violation then
+    return jsonb_build_object(
+      'ok', false,
+      'error', 'That occurrence was just changed somewhere else. Refresh and try again.'
+    );
+end;
+$$;
+
+create or replace function public.undo_reschedule(
+  p_original_id uuid,
+  p_makeup_id uuid,
+  p_original_was_virtual boolean,
+  p_prev_status public.lesson_status,
+  p_prev_amount int
+)
+returns jsonb
+language plpgsql
+set search_path = ''
+as $$
+begin
+  -- Refuse if the makeup was already resolved — deleting it would erase a
+  -- billed (or otherwise decided) row.
+  perform 1 from public.lessons
+    where id = p_makeup_id and status = 'scheduled'
+    for update;
+  if not found then
+    return jsonb_build_object(
+      'ok', false,
+      'error', 'The makeup was already marked — undo that mark first.'
+    );
+  end if;
+
+  delete from public.lessons where id = p_makeup_id;
+
+  if p_original_was_virtual then
+    delete from public.lessons where id = p_original_id;
+  else
+    update public.lessons
+       set status = p_prev_status,
+           amount_cents = p_prev_amount,
+           rescheduled_to_lesson_id = null
+     where id = p_original_id;
+  end if;
+
+  return jsonb_build_object('ok', true);
+end;
+$$;
+
+revoke all on function public.reschedule_occurrence(uuid, uuid, date, timestamptz, int, date, timestamptz) from public, anon;
+revoke all on function public.undo_reschedule(uuid, uuid, boolean, public.lesson_status, int) from public, anon;
+grant execute on function public.reschedule_occurrence(uuid, uuid, date, timestamptz, int, date, timestamptz) to authenticated;
+grant execute on function public.undo_reschedule(uuid, uuid, boolean, public.lesson_status, int) to authenticated;
 
 -- ----------------------------------------------------------------------------
 -- 11e. Supabase Storage — private buckets for worksheet + submission files.

@@ -20,10 +20,12 @@ function requireStaff(role: string): boolean {
 }
 
 /**
- * Generate a weekly parent note for one student, on demand (nothing persisted in
- * week 1 — read-only). All reads go through the RLS supabase-js client, so a
- * parent can only ever generate a note for their OWN child: if the studentId
- * isn't visible to them, the student query returns nothing and we error out.
+ * Generate a weekly parent note for one student, on demand (nothing persisted —
+ * read-only). STAFF ONLY (Slice B.5): the reviewed spine is draft → approve →
+ * send; letting a parent invoke this would hand them unreviewed AI output about
+ * their child (against doc 20 §7.3) and unmetered LLM spend on our key. The
+ * generator component is currently unmounted — the gate is here so a remount
+ * can't reopen the hole.
  */
 export async function generateWeeklyReport(input: {
   studentId: string;
@@ -34,18 +36,19 @@ export async function generateWeeklyReport(input: {
   error?: string;
 }> {
   const res = await resolveActiveTenant();
-  if (res.status !== "ok") {
-    return { ok: false, error: "You need to be signed in to do that." };
+  if (res.status !== "ok" || !requireStaff(res.tenant.role)) {
+    return { ok: false, error: "Only tutors and admins can generate notes." };
   }
   if (!input.studentId) return { ok: false, error: "No student selected." };
 
   const supabase = await createClient();
 
-  // Student — RLS-scoped. A parent only sees their own children here.
+  // Staff-tenant-scoped in code as well as RLS (doc 06 §6).
   const { data: studentData } = await supabase
     .from("students")
     .select("id, first_name, year_level")
     .eq("id", input.studentId)
+    .eq("tenant_id", res.tenant.tenantId)
     .single();
   if (!studentData) {
     return { ok: false, error: "Student not found." };
@@ -133,15 +136,19 @@ export async function editReport(input: {
   if (!input.body.trim()) return { ok: false, error: "The note can't be empty." };
 
   const supabase = await createClient();
-  const { error } = await supabase
+  const { data: updated, error } = await supabase
     .from("reports")
     .update({
       greeting: input.greeting.trim() || null,
       body: input.body.trim(),
       signoff: input.signoff.trim() || null,
     })
-    .eq("id", input.reportId);
-  if (error) return { ok: false, error: "Couldn't save your edit." };
+    .eq("id", input.reportId)
+    .eq("tenant_id", res.tenant.tenantId)
+    .select("id");
+  if (error || (updated ?? []).length === 0) {
+    return { ok: false, error: "Couldn't save your edit." };
+  }
   revalidatePath("/dashboard/reports");
   return { ok: true };
 }
@@ -158,7 +165,7 @@ export async function approveReport(
   const {
     data: { user },
   } = await supabase.auth.getUser();
-  const { error } = await supabase
+  const { data: updated, error } = await supabase
     .from("reports")
     .update({
       status: "approved",
@@ -166,16 +173,22 @@ export async function approveReport(
       approved_by: user?.id ?? null,
     })
     .eq("id", reportId)
-    .eq("status", "draft");
-  if (error) return { ok: false, error: "Couldn't approve." };
+    .eq("tenant_id", res.tenant.tenantId)
+    .eq("status", "draft")
+    .select("id");
+  if (error || (updated ?? []).length === 0) {
+    return { ok: false, error: "Couldn't approve." };
+  }
   revalidatePath("/dashboard/reports");
   return { ok: true };
 }
 
 /**
- * Send an approved note to the parent. In-app delivery is immediate (the parent
- * sees approved/sent notes on Progress). Email is GATED on the verified custom
- * domain (HEARTBEAT_EMAIL_ENABLED) — best-effort, never blocks the status change.
+ * Send an APPROVED note to the parent — approve and send are two deliberate
+ * verbs (doc 20 §7.3); a raw draft can never be sent in one call. The parent
+ * sees the note on Progress only once it is `sent` (RLS-enforced). Email is
+ * GATED on the verified custom domain (HEARTBEAT_EMAIL_ENABLED) — best-effort,
+ * never blocks the status change.
  */
 export async function sendReport(
   reportId: string,
@@ -185,12 +198,16 @@ export async function sendReport(
     return { ok: false, error: "Not allowed." };
   }
   const supabase = await createClient();
-  const { error } = await supabase
+  const { data: updated, error } = await supabase
     .from("reports")
     .update({ status: "sent", sent_at: new Date().toISOString() })
     .eq("id", reportId)
-    .in("status", ["approved", "draft"]);
-  if (error) return { ok: false, error: "Couldn't send." };
+    .eq("tenant_id", res.tenant.tenantId)
+    .eq("status", "approved")
+    .select("id");
+  if (error || (updated ?? []).length === 0) {
+    return { ok: false, error: "Approve the note first, then send." };
+  }
 
   // Email delivery — only when the verified domain is in place. Best-effort.
   if (process.env.HEARTBEAT_EMAIL_ENABLED === "true") {

@@ -26,7 +26,7 @@ interface LessonRow {
   student_id: string;
   date: string;
   status: LessonStatus;
-  note: string | null;
+  note?: string | null; // absent on the parent_lessons view (internal column)
 }
 interface ReportRow {
   id: string;
@@ -65,17 +65,26 @@ export default async function ReportsPage() {
   const students = (studentData ?? []) as unknown as StudentRow[];
 
   // This week's lessons for every visible student → deterministic win cards.
+  // Staff read the base table (notes feed the draft engine). Parents read the
+  // column-safe parent_lessons view — lesson notes are internal (doc 20 §7.6)
+  // and the base table is staff-only in RLS; the win card doesn't need them.
   const lessonsByStudent = new Map<string, ReportLesson[]>();
   if (students.length > 0) {
     const ids = students.map((s) => s.id);
-    const { data: lessonData } = await supabase
-      .from("lessons")
-      .select("student_id, date, status, note")
-      .in("student_id", ids)
-      .order("date", { ascending: false });
+    const { data: lessonData } = isStaff
+      ? await supabase
+          .from("lessons")
+          .select("student_id, date, status, note")
+          .in("student_id", ids)
+          .order("date", { ascending: false })
+      : await supabase
+          .from("parent_lessons")
+          .select("student_id, date, status")
+          .in("student_id", ids)
+          .order("date", { ascending: false });
     for (const l of (lessonData ?? []) as unknown as LessonRow[]) {
       const arr = lessonsByStudent.get(l.student_id) ?? [];
-      arr.push({ date: l.date, status: l.status, note: l.note });
+      arr.push({ date: l.date, status: l.status, note: l.note ?? null });
       lessonsByStudent.set(l.student_id, arr);
     }
   }
