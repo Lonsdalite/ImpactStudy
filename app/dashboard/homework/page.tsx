@@ -3,6 +3,7 @@ import Link from "next/link";
 import { createClient } from "@/lib/supabase/server";
 import { resolveActiveTenant } from "@/lib/tenant";
 import { signedUrls, SUBMISSIONS_BUCKET } from "@/lib/storage";
+import { nowMs, sinceMs } from "@/lib/perf";
 import { CorrectionUploader } from "@/components/dashboard/correction-uploader";
 import {
   CorrectionReview,
@@ -12,13 +13,14 @@ import {
   PendingSubmissions,
   type PendingSubmission,
 } from "@/components/dashboard/pending-submissions";
-import { BOARD_COLUMNS } from "@/lib/homework";
+import { BOARD_COLUMNS, defaultPresetKey } from "@/lib/homework";
 import type {
   AssignmentStatus,
   CorrectionStatus,
 } from "@/lib/db/schema";
 import type {
   CorrectionItem,
+  CorrectionMode,
   CorrectionStats,
   SubmissionPage,
 } from "@/lib/homework-types";
@@ -41,6 +43,7 @@ interface CorrectionRow {
   id: string;
   submission_id: string;
   status: CorrectionStatus;
+  mode: CorrectionMode | null;
   items: CorrectionItem[] | null;
   voiced_note: string | null;
   stats: CorrectionStats | null;
@@ -53,6 +56,7 @@ interface PendingRow {
   id: string;
   pages: SubmissionPage[] | null;
   student: { first_name: string; last_name: string | null } | null;
+  subject: { name: string } | null;
 }
 
 function fullName(first: string, last: string | null) {
@@ -85,12 +89,17 @@ export default async function HomeworkPage() {
 
   const supabase = await createClient();
 
+  // Perf timing (Slice C.5 item d — measure first). Logs land in the server
+  // terminal; compare before/after the scoped-revalidation + signed-URL-batching
+  // changes. Cheap enough to leave in.
+  const tQueries = nowMs();
   const [
     { data: studentData },
     { data: assignmentData },
     { data: correctionData },
     { data: pendingData },
     { data: tenantRow },
+    { data: correctedData },
   ] = await Promise.all([
     supabase
       .from("students")
@@ -107,7 +116,7 @@ export default async function HomeworkPage() {
     supabase
       .from("corrections")
       .select(
-        "id, submission_id, status, items, voiced_note, stats, model, released_at, submission:submissions(pages), student:students(first_name, last_name)",
+        "id, submission_id, status, mode, items, voiced_note, stats, model, released_at, submission:submissions(pages), student:students(first_name, last_name)",
       )
       .eq("tenant_id", tenant.tenantId)
       .order("updated_at", { ascending: false })
@@ -115,7 +124,7 @@ export default async function HomeworkPage() {
     // Submissions for the "ready to evaluate" queue (filtered to un-graded below).
     supabase
       .from("submissions")
-      .select("id, pages, student:students(first_name, last_name)")
+      .select("id, pages, student:students(first_name, last_name), subject:subjects(name)")
       .eq("tenant_id", tenant.tenantId)
       .order("created_at", { ascending: false })
       .limit(30),
@@ -124,7 +133,16 @@ export default async function HomeworkPage() {
       .select("voice_signature")
       .eq("id", tenant.tenantId)
       .single(),
+    // "Has a correction?" id-set for the pending queue. An explicit id set is
+    // robust (a PostgREST reverse-embed silently returns empty for some
+    // runtime rows). Folded into this parallel batch so it isn't a serial
+    // round-trip (Slice C.5 item d).
+    supabase
+      .from("corrections")
+      .select("submission_id")
+      .eq("tenant_id", tenant.tenantId),
   ]);
+  console.log(`[homework] queries(6)=${sinceMs(tQueries)}ms`);
 
   const students = (studentData ?? []) as unknown as StudentRow[];
   const assignments = (assignmentData ?? []) as unknown as AssignmentRow[];
@@ -153,66 +171,73 @@ export default async function HomeworkPage() {
       })),
   }));
 
-  // Correction review views — sign the image pages for viewing.
-  const correctionViews: CorrectionView[] = await Promise.all(
-    corrections.map(async (c) => {
-      const pages = (c.submission?.pages ?? []).filter((p) =>
-        p.mime.startsWith("image/"),
-      );
-      const urls = await signedUrls(
-        SUBMISSIONS_BUCKET,
-        pages.map((p) => p.path),
-      );
-      return {
-        id: c.id,
-        submissionId: c.submission_id,
-        status: c.status,
-        studentName: c.student
-          ? fullName(c.student.first_name, c.student.last_name)
-          : "Student",
-        items: c.items ?? [],
-        voicedNote: c.voiced_note ?? "",
-        stats: c.stats,
-        model: c.model,
-        pageUrls: urls.filter((u): u is string => !!u),
-        releasedAt: c.released_at,
-      };
-    }),
-  );
-
-  // Uploaded-but-not-graded submissions → the "ready to evaluate" queue.
-  // Determine "has a correction" from an explicit id set rather than a
-  // PostgREST reverse-embed (that embed silently returns empty for some rows,
-  // which would wrongly park already-graded work back in the queue).
-  const { data: correctedRows } = await supabase
-    .from("corrections")
-    .select("submission_id")
-    .eq("tenant_id", tenant.tenantId);
   const correctedIds = new Set(
-    ((correctedRows ?? []) as unknown as { submission_id: string }[]).map(
+    ((correctedData ?? []) as unknown as { submission_id: string }[]).map(
       (r) => r.submission_id,
     ),
   );
-  const pending = (pendingData ?? []) as unknown as PendingRow[];
-  const pendingViews: PendingSubmission[] = await Promise.all(
-    pending
-      .filter((s) => !correctedIds.has(s.id))
-      .map(async (s) => {
-        const imgs = (s.pages ?? []).filter((p) => p.mime.startsWith("image/"));
-        const urls = await signedUrls(
-          SUBMISSIONS_BUCKET,
-          imgs.map((p) => p.path),
-        );
-        return {
-          id: s.id,
-          studentName: s.student
-            ? fullName(s.student.first_name, s.student.last_name)
-            : "Student",
-          pageUrls: urls.filter((u): u is string => !!u),
-          pageCount: (s.pages ?? []).length,
-        };
-      }),
+  const pending = ((pendingData ?? []) as unknown as PendingRow[]).filter(
+    (s) => !correctedIds.has(s.id),
   );
+
+  // Sign EVERY image page across corrections + pending in ONE batch call
+  // (Slice C.5 item d — perf). The old code called signedUrls once per
+  // correction AND once per pending submission (~60 `createClient()` +
+  // `createSignedUrls` round-trips); this collapses to a single call, then maps
+  // paths back synchronously.
+  const imagePath = (p: SubmissionPage) => p.mime.startsWith("image/");
+  const allImagePaths = Array.from(
+    new Set([
+      ...corrections.flatMap((c) =>
+        (c.submission?.pages ?? []).filter(imagePath).map((p) => p.path),
+      ),
+      ...pending.flatMap((s) =>
+        (s.pages ?? []).filter(imagePath).map((p) => p.path),
+      ),
+    ]),
+  );
+  const tSign = nowMs();
+  const signed = await signedUrls(SUBMISSIONS_BUCKET, allImagePaths);
+  console.log(`[homework] sign(${allImagePaths.length})=${sinceMs(tSign)}ms`);
+  const urlByPath = new Map<string, string>();
+  allImagePaths.forEach((p, i) => {
+    const u = signed[i];
+    if (u) urlByPath.set(p, u);
+  });
+  const signUrls = (ps: SubmissionPage[] | null | undefined) =>
+    (ps ?? [])
+      .filter(imagePath)
+      .map((p) => urlByPath.get(p.path))
+      .filter((u): u is string => !!u);
+
+  // Correction review views.
+  const correctionViews: CorrectionView[] = corrections.map((c) => ({
+    id: c.id,
+    submissionId: c.submission_id,
+    status: c.status,
+    mode: c.mode === "language" ? "language" : "marking",
+    studentName: c.student
+      ? fullName(c.student.first_name, c.student.last_name)
+      : "Student",
+    items: c.items ?? [],
+    voicedNote: c.voiced_note ?? "",
+    stats: c.stats,
+    model: c.model,
+    pageUrls: signUrls(c.submission?.pages),
+    releasedAt: c.released_at,
+  }));
+
+  // Uploaded-but-not-graded submissions → the "ready to evaluate" queue.
+  const pendingViews: PendingSubmission[] = pending.map((s) => ({
+    id: s.id,
+    studentName: s.student
+      ? fullName(s.student.first_name, s.student.last_name)
+      : "Student",
+    subjectName: s.subject?.name ?? null,
+    defaultPresetKey: defaultPresetKey(s.subject?.name),
+    pageUrls: signUrls(s.pages),
+    pageCount: (s.pages ?? []).length,
+  }));
 
   return (
     <main className="flex-1 px-6 py-10 md:px-10">

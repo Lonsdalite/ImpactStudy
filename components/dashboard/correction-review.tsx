@@ -8,8 +8,22 @@ import {
   editCorrection,
   releaseCorrection,
 } from "@/lib/actions/homework";
-import { CORRECTION_STATUS_LABEL, VERDICT_CHIP, scoreLine } from "@/lib/homework";
-import { VERDICT_LABEL, type CorrectionItem, type CorrectionStats, type Verdict } from "@/lib/homework-types";
+import {
+  CORRECTION_STATUS_LABEL,
+  VERDICT_CHIP,
+  statsLine,
+} from "@/lib/homework";
+import {
+  ISSUE_TYPES,
+  ISSUE_TYPE_LABEL,
+  VERDICT_LABEL,
+  tallyItems,
+  type CorrectionItem,
+  type CorrectionMode,
+  type CorrectionStats,
+  type IssueType,
+  type Verdict,
+} from "@/lib/homework-types";
 import { shortDate } from "@/lib/billing";
 import type { CorrectionStatus } from "@/lib/db/schema";
 
@@ -19,6 +33,7 @@ export interface CorrectionView {
   id: string;
   submissionId: string;
   status: CorrectionStatus;
+  mode: CorrectionMode;
   studentName: string;
   items: CorrectionItem[];
   voicedNote: string;
@@ -76,16 +91,14 @@ function CorrectionCard({
   onChanged: () => void;
 }) {
   const isDraft = correction.status === "draft";
+  const isLanguage = correction.mode === "language";
   const [items, setItems] = useState<CorrectionItem[]>(correction.items);
   const [note, setNote] = useState(correction.voicedNote);
   const [isPending, startTransition] = useTransition();
 
-  const stats: CorrectionStats = {
-    total: items.length,
-    right: items.filter((i) => i.verdict === "right").length,
-    wrong: items.filter((i) => i.verdict === "wrong").length,
-    partial: items.filter((i) => i.verdict === "partial").length,
-  };
+  // Live stats for the header. Mode-aware; language preserves the model's
+  // original `reviewed` count (editing flagged items doesn't change coverage).
+  const liveStats = tallyItems(items, correction.mode, correction.stats?.reviewed);
 
   function updateItem(idx: number, patch: Partial<CorrectionItem>) {
     setItems((prev) => prev.map((it, i) => (i === idx ? { ...it, ...patch } : it)));
@@ -96,7 +109,16 @@ function CorrectionCard({
   function addItem() {
     setItems((prev) => [
       ...prev,
-      { number: prev.length + 1, verdict: "right", comment: "" },
+      isLanguage
+        ? {
+            number: prev.length + 1,
+            label: String(prev.length + 1),
+            issueType: "grammar" as IssueType,
+            original: "",
+            suggestion: "",
+            comment: "",
+          }
+        : { number: prev.length + 1, verdict: "right" as Verdict, comment: "" },
     ]);
   }
 
@@ -151,13 +173,21 @@ function CorrectionCard({
   }
 
   async function copyFeedback() {
-    const lines = [
-      note.trim(),
-      "",
-      ...items.map(
-        (it) => `Q${it.number}: ${VERDICT_LABEL[it.verdict]}${it.comment ? ` — ${it.comment}` : ""}`,
-      ),
-    ];
+    const lines = [note.trim(), ""];
+    for (const it of items) {
+      if (isLanguage) {
+        const marker = it.label || `#${it.number}`;
+        const type = it.issueType ? ISSUE_TYPE_LABEL[it.issueType] : "";
+        lines.push(`${marker}${type ? ` (${type})` : ""}${it.comment ? ` — ${it.comment}` : ""}`);
+        if (it.original || it.suggestion) {
+          lines.push(`  “${it.original ?? ""}” → “${it.suggestion ?? ""}”`);
+        }
+      } else {
+        lines.push(
+          `Q${it.number}: ${it.verdict ? VERDICT_LABEL[it.verdict] : ""}${it.comment ? ` — ${it.comment}` : ""}`,
+        );
+      }
+    }
     try {
       await navigator.clipboard.writeText(lines.join("\n"));
       toast.success("Feedback copied");
@@ -181,76 +211,55 @@ function CorrectionCard({
       </div>
 
       <p className="mt-1 text-xs text-brand-ink/55">
-        {scoreLine(stats)}
+        {statsLine(liveStats, correction.mode)}
+        {isLanguage ? " · language" : ""}
         {correction.model ? ` · drafted by ${correction.model}` : ""}
       </p>
 
       {/* The student's work */}
       {correction.pageUrls.length > 0 ? (
-        <div className="mt-3 flex gap-2 overflow-x-auto">
+        <div className="mt-3 flex gap-2 overflow-x-auto pb-1">
           {correction.pageUrls.map((u, i) => (
             // eslint-disable-next-line @next/next/no-img-element
             <img
               key={i}
               src={u}
               alt={`Page ${i + 1}`}
-              className="h-32 w-auto rounded-lg border border-brand-mist object-cover"
+              loading="lazy"
+              className="h-32 w-auto shrink-0 rounded-lg border border-brand-mist object-cover"
             />
           ))}
         </div>
       ) : null}
 
-      {/* Per-item verdicts */}
+      {/* Per-item review — verdict grid (marking) or issue + rewrite (language) */}
       <ul className="mt-4 flex flex-col gap-2">
-        {items.map((it, idx) => (
-          <li
-            key={idx}
-            className="rounded-xl border border-brand-mist bg-brand-cream/30 p-3"
-          >
-            <div className="flex items-center gap-2">
-              <span className="text-xs font-medium text-brand-plum">Q{it.number}</span>
-              {isDraft ? (
-                <select
-                  value={it.verdict}
-                  onChange={(e) => updateItem(idx, { verdict: e.target.value as Verdict })}
-                  className="rounded-lg border border-brand-mist bg-white px-2 py-1 text-xs text-brand-plum focus:outline-none"
-                >
-                  {VERDICTS.map((v) => (
-                    <option key={v} value={v}>
-                      {VERDICT_LABEL[v]}
-                    </option>
-                  ))}
-                </select>
-              ) : (
-                <span
-                  className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${VERDICT_CHIP[it.verdict]}`}
-                >
-                  {VERDICT_LABEL[it.verdict]}
-                </span>
-              )}
-              {isDraft ? (
-                <button
-                  type="button"
-                  onClick={() => removeItem(idx)}
-                  className="ml-auto text-xs text-brand-ink/45 hover:text-red-600"
-                >
-                  Remove
-                </button>
-              ) : null}
-            </div>
-            {isDraft ? (
-              <textarea
-                value={it.comment}
-                onChange={(e) => updateItem(idx, { comment: e.target.value })}
-                rows={2}
-                placeholder="What to say about this one…"
-                className="mt-2 w-full resize-y rounded-lg border border-brand-mist px-3 py-2 text-sm text-brand-ink/85 focus:border-brand-plum/30 focus:outline-none"
-              />
-            ) : it.comment ? (
-              <p className="mt-1 text-sm text-brand-ink/80">{it.comment}</p>
-            ) : null}
+        {items.map((it, idx) =>
+          isLanguage ? (
+            <LanguageItem
+              key={idx}
+              item={it}
+              isDraft={isDraft}
+              onChange={(patch) => updateItem(idx, patch)}
+              onRemove={() => removeItem(idx)}
+            />
+          ) : (
+            <MarkingItem
+              key={idx}
+              item={it}
+              isDraft={isDraft}
+              onChange={(patch) => updateItem(idx, patch)}
+              onRemove={() => removeItem(idx)}
+            />
+          ),
+        )}
+        {items.length === 0 && !isDraft ? (
+          <li className="rounded-xl border border-brand-mist bg-brand-cream/30 p-3 text-sm text-brand-ink/70">
+            {isLanguage
+              ? "Nothing to flag — the sentences all read well."
+              : "No items."}
           </li>
-        ))}
+        ) : null}
       </ul>
       {isDraft ? (
         <button
@@ -258,7 +267,7 @@ function CorrectionCard({
           onClick={addItem}
           className="mt-2 text-xs text-brand-plum-mid hover:underline"
         >
-          + Add a question
+          {isLanguage ? "+ Add a sentence" : "+ Add a question"}
         </button>
       ) : null}
 
@@ -288,7 +297,7 @@ function CorrectionCard({
               type="button"
               onClick={save}
               disabled={isPending}
-              className="rounded-lg border border-brand-mist px-4 py-1.5 text-xs font-medium text-brand-ink/70 hover:bg-brand-plum/[0.04] disabled:opacity-50"
+              className="inline-flex min-h-[44px] items-center rounded-lg border border-brand-mist px-4 py-2 text-xs font-medium text-brand-ink/70 hover:bg-brand-plum/[0.04] disabled:opacity-50"
             >
               Save draft
             </button>
@@ -296,7 +305,7 @@ function CorrectionCard({
               type="button"
               onClick={release}
               disabled={isPending}
-              className="rounded-lg bg-brand-plum px-4 py-1.5 text-xs font-medium text-brand-cream hover:bg-brand-plum-mid disabled:opacity-50"
+              className="inline-flex min-h-[44px] items-center rounded-lg bg-brand-plum px-4 py-2 text-xs font-medium text-brand-cream hover:bg-brand-plum-mid disabled:opacity-50"
             >
               Review done — return
             </button>
@@ -304,7 +313,7 @@ function CorrectionCard({
               type="button"
               onClick={discard}
               disabled={isPending}
-              className="ml-auto rounded-lg border border-brand-mist px-4 py-1.5 text-xs font-medium text-brand-ink/60 hover:text-red-600 disabled:opacity-50"
+              className="ml-auto inline-flex min-h-[44px] items-center rounded-lg border border-brand-mist px-4 py-2 text-xs font-medium text-brand-ink/60 hover:text-red-600 disabled:opacity-50"
             >
               Discard
             </button>
@@ -314,7 +323,7 @@ function CorrectionCard({
             <button
               type="button"
               onClick={copyFeedback}
-              className="rounded-lg border border-brand-plum/30 px-4 py-1.5 text-xs font-medium text-brand-plum hover:bg-brand-plum/[0.06]"
+              className="inline-flex min-h-[44px] items-center rounded-lg border border-brand-plum/30 px-4 py-2 text-xs font-medium text-brand-plum hover:bg-brand-plum/[0.06]"
             >
               Copy feedback
             </button>
@@ -327,5 +336,162 @@ function CorrectionCard({
         )}
       </div>
     </div>
+  );
+}
+
+/** MARKING item — the original verdict + comment row (unchanged behaviour). */
+function MarkingItem({
+  item,
+  isDraft,
+  onChange,
+  onRemove,
+}: {
+  item: CorrectionItem;
+  isDraft: boolean;
+  onChange: (patch: Partial<CorrectionItem>) => void;
+  onRemove: () => void;
+}) {
+  return (
+    <li className="rounded-xl border border-brand-mist bg-brand-cream/30 p-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-xs font-medium text-brand-plum">Q{item.number}</span>
+        {isDraft ? (
+          <select
+            value={item.verdict ?? "right"}
+            onChange={(e) => onChange({ verdict: e.target.value as Verdict })}
+            className="min-h-[36px] rounded-lg border border-brand-mist bg-white px-2 py-1 text-xs text-brand-plum focus:outline-none"
+          >
+            {VERDICTS.map((v) => (
+              <option key={v} value={v}>
+                {VERDICT_LABEL[v]}
+              </option>
+            ))}
+          </select>
+        ) : item.verdict ? (
+          <span
+            className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${VERDICT_CHIP[item.verdict]}`}
+          >
+            {VERDICT_LABEL[item.verdict]}
+          </span>
+        ) : null}
+        {isDraft ? (
+          <button
+            type="button"
+            onClick={onRemove}
+            className="ml-auto text-xs text-brand-ink/45 hover:text-red-600"
+          >
+            Remove
+          </button>
+        ) : null}
+      </div>
+      {isDraft ? (
+        <textarea
+          value={item.comment}
+          onChange={(e) => onChange({ comment: e.target.value })}
+          rows={2}
+          placeholder="What to say about this one…"
+          className="mt-2 w-full resize-y rounded-lg border border-brand-mist px-3 py-2 text-sm text-brand-ink/85 focus:border-brand-plum/30 focus:outline-none"
+        />
+      ) : item.comment ? (
+        <p className="mt-1 text-sm text-brand-ink/80">{item.comment}</p>
+      ) : null}
+    </li>
+  );
+}
+
+/** LANGUAGE item — issue-type + original → suggested rewrite, no verdict. */
+function LanguageItem({
+  item,
+  isDraft,
+  onChange,
+  onRemove,
+}: {
+  item: CorrectionItem;
+  isDraft: boolean;
+  onChange: (patch: Partial<CorrectionItem>) => void;
+  onRemove: () => void;
+}) {
+  const marker = item.label || `#${item.number}`;
+  return (
+    <li className="rounded-xl border border-brand-mist bg-brand-cream/30 p-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-xs font-medium text-brand-plum">{marker}</span>
+        {isDraft ? (
+          <select
+            value={item.issueType ?? "grammar"}
+            onChange={(e) => onChange({ issueType: e.target.value as IssueType })}
+            className="min-h-[36px] rounded-lg border border-brand-mist bg-white px-2 py-1 text-xs text-brand-plum focus:outline-none"
+          >
+            {ISSUE_TYPES.map((t) => (
+              <option key={t} value={t}>
+                {ISSUE_TYPE_LABEL[t]}
+              </option>
+            ))}
+          </select>
+        ) : item.issueType ? (
+          <span className="rounded-full bg-brand-plum/10 px-2 py-0.5 text-[11px] font-medium text-brand-plum">
+            {ISSUE_TYPE_LABEL[item.issueType]}
+          </span>
+        ) : null}
+        {isDraft ? (
+          <button
+            type="button"
+            onClick={onRemove}
+            className="ml-auto text-xs text-brand-ink/45 hover:text-red-600"
+          >
+            Remove
+          </button>
+        ) : null}
+      </div>
+
+      {isDraft ? (
+        <div className="mt-2 flex flex-col gap-2">
+          <label className="text-[11px] text-brand-ink/50">
+            Original
+            <textarea
+              value={item.original ?? ""}
+              onChange={(e) => onChange({ original: e.target.value })}
+              rows={2}
+              placeholder="What the student wrote…"
+              className="mt-0.5 w-full resize-y rounded-lg border border-brand-mist px-3 py-2 text-sm text-brand-ink/70 focus:border-brand-plum/30 focus:outline-none"
+            />
+          </label>
+          <label className="text-[11px] text-brand-ink/50">
+            Suggested rewrite
+            <textarea
+              value={item.suggestion ?? ""}
+              onChange={(e) => onChange({ suggestion: e.target.value })}
+              rows={2}
+              placeholder="Your corrected version…"
+              className="mt-0.5 w-full resize-y rounded-lg border border-brand-mist px-3 py-2 text-sm text-brand-ink/85 focus:border-brand-plum/30 focus:outline-none"
+            />
+          </label>
+          <input
+            type="text"
+            value={item.comment}
+            onChange={(e) => onChange({ comment: e.target.value })}
+            placeholder="Why (optional) — e.g. comma splice, use a semicolon"
+            className="w-full rounded-lg border border-brand-mist px-3 py-2 text-xs text-brand-ink/70 focus:border-brand-plum/30 focus:outline-none"
+          />
+        </div>
+      ) : (
+        <div className="mt-1.5 text-sm">
+          {item.original ? (
+            <p className="text-brand-ink/55 line-through decoration-brand-ink/25">
+              {item.original}
+            </p>
+          ) : null}
+          {item.suggestion ? (
+            <p className="mt-0.5 text-brand-ink/85">
+              <span className="text-brand-plum-mid">→ </span>
+              {item.suggestion}
+            </p>
+          ) : null}
+          {item.comment ? (
+            <p className="mt-1 text-xs text-brand-ink/55">{item.comment}</p>
+          ) : null}
+        </div>
+      )}
+    </li>
   );
 }

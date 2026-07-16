@@ -6,7 +6,13 @@ import { createClient } from "@/lib/supabase/server";
 import { FATIMA_VOICE } from "@/lib/llm/voice";
 import { gradeSubmission, type GradePage } from "@/lib/llm/grade-submission";
 import { downloadBase64, SUBMISSIONS_BUCKET } from "@/lib/storage";
-import { tallyItems, type CorrectionItem, type SubmissionPage } from "@/lib/homework-types";
+import {
+  tallyItems,
+  type CorrectionItem,
+  type CorrectionMode,
+  type CorrectionStats,
+  type SubmissionPage,
+} from "@/lib/homework-types";
 import { MAX_SUBMISSION_PAGES } from "@/lib/homework";
 import type { VoiceSignature } from "@/lib/voice-types";
 
@@ -41,6 +47,22 @@ function isAllowedMime(mime: string | null | undefined): boolean {
 
 function isTenantPath(path: string | null | undefined, tenantId: string): boolean {
   return !!path && path.startsWith(`${tenantId}/`) && !path.includes("..");
+}
+
+/**
+ * Scoped homework revalidation (Slice C.5 item d — perf). The old
+ * `revalidatePath("/dashboard", "layout")` was a hammer: it invalidates the
+ * ENTIRE /dashboard subtree cache AND re-runs the shell layout's getUser() +
+ * memberships-join on every homework tap, then re-renders the whole shell. The
+ * only surfaces a homework mutation changes are the Homework hub (board +
+ * drafts + pending) and the touched student's pipeline — revalidate exactly
+ * those, page-scoped, never the layout. When the studentId isn't known cheaply,
+ * fall back to the dynamic-route form (marks all student detail pages stale
+ * without re-running the layout). */
+function revalidateHomework(studentId?: string | null) {
+  revalidatePath("/dashboard/homework");
+  if (studentId) revalidatePath(`/dashboard/students/${studentId}`);
+  else revalidatePath("/dashboard/students/[id]", "page");
 }
 
 // ---------------------------------------------------------------------------
@@ -150,7 +172,7 @@ export async function createAssignment(input: {
     note: input.note?.trim() || null,
   });
   if (error) return { ok: false, error: "Couldn't create the assignment." };
-  revalidatePath("/dashboard", "layout");
+  revalidateHomework(input.studentId);
   return { ok: true };
 }
 
@@ -183,7 +205,7 @@ export async function moveAssignmentUpNext(
     .from("assignments")
     .update({ order_index: min - 1 })
     .eq("id", assignmentId);
-  revalidatePath("/dashboard", "layout");
+  revalidateHomework(studentId);
   return { ok: !error };
 }
 
@@ -198,7 +220,7 @@ export async function setAssignmentStatus(
     .from("assignments")
     .update({ status })
     .eq("id", assignmentId);
-  revalidatePath("/dashboard", "layout");
+  revalidateHomework();
   return { ok: !error };
 }
 
@@ -266,7 +288,7 @@ export async function createSubmission(input: {
   }
 
   const submissionId = (data as unknown as { id: string }).id;
-  revalidatePath("/dashboard/homework");
+  revalidateHomework(input.studentId);
   return { ok: true, submissionId };
 }
 
@@ -284,11 +306,12 @@ export async function discardSubmission(
   const supabase = await createClient();
   const { data } = await supabase
     .from("submissions")
-    .select("assignment_id, pages")
+    .select("assignment_id, student_id, pages")
     .eq("id", submissionId)
     .single();
   const sub = data as unknown as {
     assignment_id: string | null;
+    student_id: string | null;
     pages: SubmissionPage[] | null;
   } | null;
 
@@ -312,7 +335,7 @@ export async function discardSubmission(
       .eq("id", sub.assignment_id);
   }
 
-  revalidatePath("/dashboard/homework");
+  revalidateHomework(sub?.student_id);
   return { ok: true };
 }
 
@@ -321,13 +344,22 @@ export async function discardSubmission(
 // ---------------------------------------------------------------------------
 
 /** Draft a correction for a submission: download the pages, run the grading
- *  model, and persist a DRAFT correction. Never releases. */
+ *  model, and persist a DRAFT correction. Never releases.
+ *
+ *  Slice C.5 (doc 36 item b): `mode` selects the output model (marking |
+ *  language, default marking) and `instruction` is the optional free-text
+ *  "Anything specific?" note appended to the grader prompt. */
 export async function draftCorrection(input: {
   submissionId: string;
+  mode?: CorrectionMode;
+  instruction?: string;
 }): Promise<{ ok: boolean; error?: string }> {
   const tenant = await requireStaff();
   if (!tenant) return { ok: false, error: "Not allowed." };
   if (!input.submissionId) return { ok: false, error: "No submission." };
+  // Whitelist the mode; anything unexpected falls back to the safe default.
+  const mode: CorrectionMode = input.mode === "language" ? "language" : "marking";
+  const instruction = (input.instruction ?? "").trim().slice(0, 500);
 
   const supabase = await createClient();
 
@@ -396,6 +428,10 @@ export async function draftCorrection(input: {
     graded = await gradeSubmission({
       voice,
       pages,
+      mode,
+      instruction,
+      // Privacy (doc 35e §1): first name only into the prompt, never a full
+      // legal name.
       studentName: submission.student?.first_name,
       yearLevel: submission.student?.year_level ?? undefined,
       subject: submission.subject?.name,
@@ -414,6 +450,7 @@ export async function draftCorrection(input: {
     submission_id: input.submissionId,
     student_id: submission.student_id,
     status: "draft" as const,
+    mode: graded.mode,
     items: graded.items,
     voiced_note: graded.voicedNote,
     stats: graded.stats,
@@ -443,11 +480,14 @@ export async function draftCorrection(input: {
       .in("status", ["assigned", "submitted"]);
   }
 
-  revalidatePath("/dashboard/homework");
+  revalidateHomework(submission.student_id);
   return { ok: true };
 }
 
-/** Edit a draft correction's verdicts + voiced note before release. */
+/** Edit a draft correction's items + voiced note before release. Stats are
+ *  recomputed MODE-AWARE (doc 36 item b): marking → verdict tally; language →
+ *  reviewed/suggestions, preserving the model's original `reviewed` count (the
+ *  tutor editing flagged items doesn't change how many sentences were read). */
 export async function editCorrection(input: {
   correctionId: string;
   items: CorrectionItem[];
@@ -456,17 +496,32 @@ export async function editCorrection(input: {
   if (!(await requireStaff())) return { ok: false, error: "Not allowed." };
   if (!input.correctionId) return { ok: false, error: "No correction." };
   const supabase = await createClient();
+
+  // Read the mode + the existing reviewed count so language stats stay right.
+  const { data: existing } = await supabase
+    .from("corrections")
+    .select("mode, stats, student_id")
+    .eq("id", input.correctionId)
+    .single();
+  const row = existing as unknown as {
+    mode: CorrectionMode | null;
+    stats: CorrectionStats | null;
+    student_id: string | null;
+  } | null;
+  const mode: CorrectionMode = row?.mode === "language" ? "language" : "marking";
+  const reviewed = row?.stats?.reviewed;
+
   const { error } = await supabase
     .from("corrections")
     .update({
       items: input.items,
       voiced_note: input.voicedNote.trim() || null,
-      stats: tallyItems(input.items),
+      stats: tallyItems(input.items, mode, reviewed),
       updated_at: new Date().toISOString(),
     })
     .eq("id", input.correctionId);
   if (error) return { ok: false, error: "Couldn't save your edits." };
-  revalidatePath("/dashboard/homework");
+  revalidateHomework(row?.student_id);
   return { ok: true };
 }
 
@@ -482,20 +537,25 @@ export async function releaseCorrection(
 
   const { data } = await supabase
     .from("corrections")
-    .select("items, submission_id")
+    .select("items, submission_id, student_id, mode, stats")
     .eq("id", correctionId)
     .single();
   const row = data as unknown as {
     items: CorrectionItem[];
     submission_id: string;
+    student_id: string | null;
+    mode: CorrectionMode | null;
+    stats: CorrectionStats | null;
   } | null;
   if (!row) return { ok: false, error: "Correction not found." };
+  const mode: CorrectionMode = row.mode === "language" ? "language" : "marking";
 
   const { error } = await supabase
     .from("corrections")
     .update({
       status: "released",
-      stats: tallyItems(row.items ?? []),
+      // Freeze the stats snapshot at release (mode-aware).
+      stats: tallyItems(row.items ?? [], mode, row.stats?.reviewed),
       released_at: new Date().toISOString(),
     })
     .eq("id", correctionId);
@@ -516,6 +576,6 @@ export async function releaseCorrection(
       .eq("id", assignmentId);
   }
 
-  revalidatePath("/dashboard", "layout");
+  revalidateHomework(row.student_id);
   return { ok: true };
 }

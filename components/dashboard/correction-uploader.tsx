@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import { createClient } from "@/lib/supabase/client";
@@ -23,7 +23,19 @@ export interface UploaderAssignment {
   title: string;
 }
 
-const ACCEPT = "image/*,application/pdf";
+const ACCEPT_FILES = "image/*,application/pdf";
+
+/** One picked page, before upload. `url` is an object URL for image previews
+ *  (null for PDFs, which show a filename chip instead). */
+interface PickedPage {
+  key: string; // dedupe + react key: name|size|lastModified
+  file: File;
+  url: string | null;
+}
+
+function pageKey(f: File): string {
+  return `${f.name}|${f.size}|${f.lastModified}`;
+}
 
 function safeName(name: string): string {
   return name.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-60) || "page";
@@ -39,11 +51,25 @@ export function CorrectionUploader({
   openAssignments: UploaderAssignment[];
 }) {
   const router = useRouter();
-  const fileRef = useRef<HTMLInputElement>(null);
+  const cameraRef = useRef<HTMLInputElement>(null);
+  const filesRef = useRef<HTMLInputElement>(null);
   const [studentId, setStudentId] = useState(students[0]?.id ?? "");
   const [assignmentId, setAssignmentId] = useState("");
-  const [files, setFiles] = useState<File[]>([]);
+  const [pages, setPages] = useState<PickedPage[]>([]);
   const [phase, setPhase] = useState<"idle" | "uploading">("idle");
+
+  // Revoke every object URL on unmount so a long correction session doesn't leak
+  // blob URLs. (Per-page revocation on remove is handled in removePage.) The ref
+  // is mirrored inside an effect — never assigned during render.
+  const pagesRef = useRef<PickedPage[]>([]);
+  useEffect(() => {
+    pagesRef.current = pages;
+  }, [pages]);
+  useEffect(() => {
+    return () => {
+      for (const p of pagesRef.current) if (p.url) URL.revokeObjectURL(p.url);
+    };
+  }, []);
 
   const studentAssignments = useMemo(
     () => openAssignments.filter((a) => a.studentId === studentId),
@@ -52,36 +78,96 @@ export function CorrectionUploader({
 
   const busy = phase !== "idle";
 
+  /** ADDITIVE capture (Slice C.5 item a). The old uploader did
+   *  `setFiles(Array.from(e.target.files))` — a phone camera returns one photo
+   *  per tap, so page 2 REPLACED page 1. Here each pick APPENDS to the growing
+   *  strip, deduped by name+size+lastModified. */
+  function addFiles(list: FileList | null) {
+    if (!list || list.length === 0) return;
+    const incoming = Array.from(list);
+    setPages((prev) => {
+      const have = new Set(prev.map((p) => p.key));
+      const next = [...prev];
+      let skippedDupes = 0;
+      let skippedFull = 0;
+      for (const f of incoming) {
+        const key = pageKey(f);
+        if (have.has(key)) {
+          skippedDupes += 1;
+          continue;
+        }
+        if (next.length >= MAX_SUBMISSION_PAGES) {
+          skippedFull += 1;
+          continue;
+        }
+        have.add(key);
+        next.push({
+          key,
+          file: f,
+          url: f.type.startsWith("image/") ? URL.createObjectURL(f) : null,
+        });
+      }
+      if (skippedDupes > 0)
+        toast.message(
+          `Skipped ${skippedDupes} page${skippedDupes > 1 ? "s" : ""} already added`,
+        );
+      if (skippedFull > 0)
+        toast.error(`That's the max of ${MAX_SUBMISSION_PAGES} pages`);
+      return next;
+    });
+  }
+
+  function removePage(key: string) {
+    setPages((prev) => {
+      const gone = prev.find((p) => p.key === key);
+      if (gone?.url) URL.revokeObjectURL(gone.url);
+      return prev.filter((p) => p.key !== key);
+    });
+  }
+
+  function movePage(index: number, dir: -1 | 1) {
+    setPages((prev) => {
+      const to = index + dir;
+      if (to < 0 || to >= prev.length) return prev;
+      const next = [...prev];
+      [next[index], next[to]] = [next[to], next[index]];
+      return next;
+    });
+  }
+
+  function clearPages() {
+    for (const p of pages) if (p.url) URL.revokeObjectURL(p.url);
+    setPages([]);
+    if (cameraRef.current) cameraRef.current.value = "";
+    if (filesRef.current) filesRef.current.value = "";
+  }
+
   async function run() {
     if (!studentId) {
       toast.error("Pick a student");
       return;
     }
-    if (files.length === 0) {
+    if (pages.length === 0) {
       toast.error("Add at least one photo or PDF");
       return;
     }
-    if (files.length > MAX_SUBMISSION_PAGES) {
-      toast.error(`Up to ${MAX_SUBMISSION_PAGES} pages at a time`);
-      return;
-    }
-    const oversized = files.find((f) => f.size > MAX_UPLOAD_BYTES);
+    const oversized = pages.find((p) => p.file.size > MAX_UPLOAD_BYTES);
     if (oversized) {
       toast.error(
-        `"${oversized.name}" is over 10 MB — a phone photo is usually well under that.`,
+        `"${oversized.file.name}" is over 10 MB — a phone photo is usually well under that.`,
       );
       return;
     }
     const supabase = createClient();
     const uploadId = crypto.randomUUID();
-    const pages: SubmissionPage[] = [];
+    const uploaded: SubmissionPage[] = [];
 
     setPhase("uploading");
     try {
-      for (let i = 0; i < files.length; i++) {
+      for (let i = 0; i < pages.length; i++) {
         // Shrink big photos before upload — cuts both storage and grading
         // tokens (Claude downscales anyway). PDFs pass through untouched.
-        const f = await downscaleImage(files[i]);
+        const f = await downscaleImage(pages[i].file);
         const path = `${tenantId}/${uploadId}/${i}-${safeName(f.name)}`;
         const { error } = await supabase.storage
           .from(SUBMISSIONS_BUCKET)
@@ -91,7 +177,7 @@ export function CorrectionUploader({
           toast.error(`Upload failed: ${error.message}`);
           return;
         }
-        pages.push({
+        uploaded.push({
           path,
           name: f.name,
           mime: f.type || "application/octet-stream",
@@ -106,7 +192,7 @@ export function CorrectionUploader({
     const sub = await createSubmission({
       studentId,
       assignmentId: assignmentId || null,
-      pages,
+      pages: uploaded,
     });
     setPhase("idle");
     if (!sub.ok || !sub.submissionId) {
@@ -114,19 +200,20 @@ export function CorrectionUploader({
       return;
     }
 
-    toast.success("Uploaded — hit “Evaluate with AI” below to mark it.");
-    setFiles([]);
+    toast.success("Uploaded — hit “Evaluate” below to mark it.");
+    clearPages();
     setAssignmentId("");
-    if (fileRef.current) fileRef.current.value = "";
     router.refresh();
   }
+
+  const pageCount = pages.length;
 
   return (
     <div className="rounded-2xl border border-brand-mist bg-white p-5">
       <h2 className="text-sm font-medium text-brand-plum">Correct a page</h2>
       <p className="mt-1 text-xs text-brand-ink/55">
-        Snap the student&apos;s work and upload it. Then evaluate it with AI
-        below, and review every mark before anything goes out. No assignment
+        Snap each page of the student&apos;s work — add as many as you need, then
+        upload. You review every mark before anything goes out. No assignment
         needed.
       </p>
 
@@ -139,7 +226,7 @@ export function CorrectionUploader({
               setStudentId(e.target.value);
               setAssignmentId("");
             }}
-            className="mt-1 block rounded-lg border border-brand-mist bg-white px-2 py-1.5 text-sm text-brand-plum focus:outline-none"
+            className="mt-1 block min-h-[44px] rounded-lg border border-brand-mist bg-white px-2 py-2 text-sm text-brand-plum focus:outline-none"
           >
             {students.map((s) => (
               <option key={s.id} value={s.id}>
@@ -155,7 +242,7 @@ export function CorrectionUploader({
             <select
               value={assignmentId}
               onChange={(e) => setAssignmentId(e.target.value)}
-              className="mt-1 block rounded-lg border border-brand-mist bg-white px-2 py-1.5 text-sm text-brand-plum focus:outline-none"
+              className="mt-1 block min-h-[44px] rounded-lg border border-brand-mist bg-white px-2 py-2 text-sm text-brand-plum focus:outline-none"
             >
               <option value="">Standalone (no assignment)</option>
               {studentAssignments.map((a) => (
@@ -168,27 +255,141 @@ export function CorrectionUploader({
         ) : null}
       </div>
 
+      {/* Hidden inputs. Camera is image-only + capture-hint so a phone opens the
+          camera straight away; "Add files" allows the gallery + PDFs. Both are
+          additive (each onChange appends, then resets so re-picking the same
+          file still fires). */}
       <input
-        ref={fileRef}
+        ref={cameraRef}
         type="file"
-        accept={ACCEPT}
-        multiple
-        onChange={(e) => setFiles(Array.from(e.target.files ?? []))}
-        className="mt-4 block w-full text-sm text-brand-ink/70 file:mr-3 file:rounded-lg file:border-0 file:bg-brand-plum file:px-4 file:py-2 file:text-sm file:font-medium file:text-brand-cream hover:file:bg-brand-plum-mid"
+        accept="image/*"
+        capture="environment"
+        className="hidden"
+        onChange={(e) => {
+          addFiles(e.target.files);
+          e.target.value = "";
+        }}
       />
-      {files.length > 0 ? (
-        <p className="mt-2 text-xs text-brand-ink/55">
-          {files.length} page{files.length > 1 ? "s" : ""} ready
-        </p>
+      <input
+        ref={filesRef}
+        type="file"
+        accept={ACCEPT_FILES}
+        multiple
+        className="hidden"
+        onChange={(e) => {
+          addFiles(e.target.files);
+          e.target.value = "";
+        }}
+      />
+
+      <div className="mt-4 flex flex-wrap gap-2">
+        <button
+          type="button"
+          onClick={() => cameraRef.current?.click()}
+          disabled={busy || pageCount >= MAX_SUBMISSION_PAGES}
+          className="inline-flex min-h-[44px] items-center rounded-lg bg-brand-plum px-4 py-2 text-sm font-medium text-brand-cream transition-colors hover:bg-brand-plum-mid disabled:opacity-50"
+        >
+          {pageCount === 0 ? "Take photo" : "Add page"}
+        </button>
+        <button
+          type="button"
+          onClick={() => filesRef.current?.click()}
+          disabled={busy || pageCount >= MAX_SUBMISSION_PAGES}
+          className="inline-flex min-h-[44px] items-center rounded-lg border border-brand-mist px-4 py-2 text-sm font-medium text-brand-ink/70 transition-colors hover:bg-brand-plum/[0.04] disabled:opacity-50"
+        >
+          Add files
+        </button>
+      </div>
+
+      {pageCount > 0 ? (
+        <>
+          <div className="mt-4 flex items-center justify-between">
+            <p className="text-xs font-medium text-brand-ink/60">
+              {pageCount} page{pageCount > 1 ? "s" : ""} ready
+            </p>
+            <button
+              type="button"
+              onClick={clearPages}
+              disabled={busy}
+              className="text-xs text-brand-ink/45 hover:text-red-600 disabled:opacity-50"
+            >
+              Clear all
+            </button>
+          </div>
+
+          {/* Thumbnail strip — scrolls horizontally on a narrow phone, but is a
+              contained strip (never forces the whole page to scroll). */}
+          <div className="mt-2 flex gap-3 overflow-x-auto pb-1">
+            {pages.map((p, i) => (
+              <div
+                key={p.key}
+                className="relative shrink-0"
+                style={{ width: 96 }}
+              >
+                <div className="flex h-28 w-24 items-center justify-center overflow-hidden rounded-lg border border-brand-mist bg-brand-cream/40">
+                  {p.url ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img
+                      src={p.url}
+                      alt={`Page ${i + 1}`}
+                      loading="lazy"
+                      className="h-full w-full object-cover"
+                    />
+                  ) : (
+                    <span className="px-1 text-center text-[10px] leading-tight text-brand-ink/60">
+                      PDF
+                      <br />
+                      {p.file.name.slice(-16)}
+                    </span>
+                  )}
+                </div>
+                <span className="absolute left-1 top-1 rounded-full bg-brand-plum/85 px-1.5 py-0.5 text-[10px] font-medium text-brand-cream">
+                  {i + 1}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => removePage(p.key)}
+                  disabled={busy}
+                  aria-label={`Remove page ${i + 1}`}
+                  className="absolute -right-1.5 -top-1.5 flex h-6 w-6 items-center justify-center rounded-full border border-brand-mist bg-white text-sm text-brand-ink/60 shadow-sm hover:text-red-600 disabled:opacity-50"
+                >
+                  ×
+                </button>
+                <div className="mt-1 flex justify-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => movePage(i, -1)}
+                    disabled={busy || i === 0}
+                    aria-label={`Move page ${i + 1} earlier`}
+                    className="text-xs text-brand-plum-mid disabled:opacity-30"
+                  >
+                    ←
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => movePage(i, 1)}
+                    disabled={busy || i === pages.length - 1}
+                    aria-label={`Move page ${i + 1} later`}
+                    className="text-xs text-brand-plum-mid disabled:opacity-30"
+                  >
+                    →
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
       ) : null}
 
       <button
         type="button"
         onClick={run}
-        disabled={busy || students.length === 0}
-        className="mt-4 rounded-lg bg-brand-plum px-5 py-2 text-sm font-medium text-brand-cream transition-colors hover:bg-brand-plum-mid disabled:opacity-50"
+        disabled={busy || pageCount === 0 || students.length === 0}
+        className="mt-4 inline-flex min-h-[44px] items-center rounded-lg bg-brand-plum px-5 py-2 text-sm font-medium text-brand-cream transition-colors hover:bg-brand-plum-mid disabled:opacity-50"
       >
-        {phase === "uploading" ? "Uploading…" : "Upload"}
+        {phase === "uploading"
+          ? "Uploading…"
+          : `Upload${pageCount > 1 ? ` ${pageCount} pages` : ""}`}
       </button>
     </div>
   );
