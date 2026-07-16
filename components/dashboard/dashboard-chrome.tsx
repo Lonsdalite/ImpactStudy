@@ -152,7 +152,11 @@ export function DashboardChrome({
             </button>
           </form>
         </div>
-        <nav className="flex gap-1 overflow-x-auto px-3 pb-2">
+        {/* Horizontal pill bar. It scrolls WITHIN itself (a contained strip) —
+            the page body never scrolls sideways. Tap targets are ≥44px tall
+            (Slice C.5 item c). `overscroll-x-contain` keeps a sideways swipe from
+            bouncing the whole page. */}
+        <nav className="flex gap-1 overflow-x-auto overscroll-x-contain px-3 pb-2">
           {nav.map((item) => {
             const active = isActive(pathname, item.href);
             return (
@@ -160,7 +164,7 @@ export function DashboardChrome({
                 key={item.href}
                 href={item.href}
                 className={
-                  "shrink-0 rounded-full px-3 py-1.5 text-sm font-medium transition-colors " +
+                  "flex min-h-[44px] shrink-0 items-center rounded-full px-3.5 text-sm font-medium transition-colors " +
                   (active
                     ? "bg-brand-plum text-brand-cream"
                     : "text-brand-ink/70 hover:bg-brand-plum/[0.05]")

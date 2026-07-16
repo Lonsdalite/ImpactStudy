@@ -123,10 +123,12 @@ const SUB = {
   bilal: "a0000000-0000-4000-8000-000000000091",
   dev: "a0000000-0000-4000-8000-000000000092",
   chloe: "a0000000-0000-4000-8000-000000000093",
+  chloeLang: "a0000000-0000-4000-8000-000000000094", // standalone English (language mode)
 };
 const CORR = {
   dev: "a0000000-0000-4000-8000-0000000000a1",
   chloe: "a0000000-0000-4000-8000-0000000000a2",
+  chloeLang: "a0000000-0000-4000-8000-0000000000a3", // language-mode draft (Slice C.5)
 };
 
 // ---------- clients ----------
@@ -466,6 +468,8 @@ async function main() {
     { id: SUB.bilal, tenantId: TENANT_ID, studentId: ST.bilal, assignmentId: AS.bilalPages, subjectId: SUBJ.maths, uploaderRole: "tutor", pages: placeholderPages },
     { id: SUB.dev, tenantId: TENANT_ID, studentId: ST.dev, assignmentId: AS.devBalancing, subjectId: SUBJ.chemistry, uploaderRole: "tutor", pages: placeholderPages },
     { id: SUB.chloe, tenantId: TENANT_ID, studentId: ST.chloe, assignmentId: AS.chloeComprehension, subjectId: SUBJ.english, uploaderRole: "tutor", pages: placeholderPages },
+    // Standalone English submission (no assignment) → the language-mode draft below.
+    { id: SUB.chloeLang, tenantId: TENANT_ID, studentId: ST.chloe, assignmentId: null, subjectId: SUBJ.english, uploaderRole: "tutor", pages: placeholderPages },
   ]);
 
   const devItems: CorrectionItem[] = [
@@ -479,12 +483,22 @@ async function main() {
     { number: 3, verdict: "partial", comment: "Nearly there — just tie your answer back to the question." },
   ];
 
+  // Language-mode example (Slice C.5) — per-sentence issue + suggested rewrite,
+  // no verdict. Mirrors Fatima's real Claude flow: flag only the slips, and the
+  // note says the rest were fine. reviewedCount (12) > flagged (3).
+  const chloeLangItems: CorrectionItem[] = [
+    { number: 1, label: "2", issueType: "typo", original: "Food is like fuel to the hunan body.", suggestion: "Food is like fuel to the human body.", comment: "Typo: “hunan” should be “human”." },
+    { number: 2, label: "4", issueType: "punctuation", original: "I don't want to lose my precious cats, they mean everything to me.", suggestion: "I don't want to lose my precious cats; they mean everything to me.", comment: "Comma splice — use a semicolon, not a comma." },
+    { number: 3, label: "10", issueType: "style", original: "There was a beautiful sunset sight.", suggestion: "The sunset was a beautiful sight.", comment: "Redundant — “sunset sight” doubles up." },
+  ];
+
   await db.insert(schema.corrections).values([
-    { id: CORR.dev, tenantId: TENANT_ID, submissionId: SUB.dev, studentId: ST.dev, status: "draft", items: devItems, voicedNote: "Hey Dev, solid effort on the balancing set. Q1 was spot on. On Q2 just recount your oxygens, and Q3 needs one more coefficient. You're really getting the hang of this.", stats: tallyItems(devItems), model: "claude-sonnet-5" },
-    { id: CORR.chloe, tenantId: TENANT_ID, submissionId: SUB.chloe, studentId: ST.chloe, status: "released", items: chloeItems, voicedNote: "Hi Chloe, lovely work on The Lighthouse. Your evidence in Q1 and Q2 was exactly right. Just tie Q3 back to the question and it's perfect. I can see you're putting the effort in!", stats: tallyItems(chloeItems), model: "claude-sonnet-5", releasedAt: new Date() },
+    { id: CORR.dev, tenantId: TENANT_ID, submissionId: SUB.dev, studentId: ST.dev, status: "draft", mode: "marking", items: devItems, voicedNote: "Hey Dev, solid effort on the balancing set. Q1 was spot on. On Q2 just recount your oxygens, and Q3 needs one more coefficient. You're really getting the hang of this.", stats: tallyItems(devItems), model: "claude-sonnet-5" },
+    { id: CORR.chloe, tenantId: TENANT_ID, submissionId: SUB.chloe, studentId: ST.chloe, status: "released", mode: "marking", items: chloeItems, voicedNote: "Hi Chloe, lovely work on The Lighthouse. Your evidence in Q1 and Q2 was exactly right. Just tie Q3 back to the question and it's perfect. I can see you're putting the effort in!", stats: tallyItems(chloeItems), model: "claude-sonnet-5", releasedAt: new Date() },
+    { id: CORR.chloeLang, tenantId: TENANT_ID, submissionId: SUB.chloeLang, studentId: ST.chloe, status: "draft", mode: "language", items: chloeLangItems, voicedNote: "Hi Chloe, I went through all twelve of your sentences and only three needed a tweak — the rest read really well. Two little typos and a comma splice, all noted below. Your vocabulary is coming along nicely.", stats: tallyItems(chloeLangItems, "language", 12), model: "claude-sonnet-5" },
   ]);
 
-  console.log("Seeded Slice C: 3 worksheets, 4 assignments, 3 submissions, 2 corrections.");
+  console.log("Seeded Slice C: 3 worksheets, 4 assignments, 4 submissions, 3 corrections (1 language mode).");
   console.log("\n✅ Seed complete.\n");
   console.log("Log in (magic link) to verify RLS:");
   console.log(`  OWNER  ${ownerEmail}   → all 4 students, 7 enrollments, weekly calendar`);

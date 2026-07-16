@@ -15,6 +15,13 @@
       "when": 1783946269491,
       "tag": "0001_parallel_archangel",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1784122543536,
+      "tag": "0002_awesome_malice",
+      "breakpoints": true
     }
   ]
 }

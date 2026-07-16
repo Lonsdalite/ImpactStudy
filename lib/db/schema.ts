@@ -76,6 +76,15 @@ export const correctionStatusEnum = pgEnum("correction_status", [
   "released",
 ]);
 
+// The correction's output model (Slice C.5, doc 36 item b — Muqsith-blessed).
+// `marking` = per-question verdict grid (maths/science, the original Slice C
+// behaviour). `language` = per-sentence issue-type + suggested rewrite, no
+// verdict (English). Defaults to `marking` so every existing row is unchanged.
+export const correctionModeEnum = pgEnum("correction_mode", [
+  "marking",
+  "language",
+]);
+
 // Who uploaded a submission. Polymorphic in the model; pilot = tutor only.
 // student/parent uploads arrive with Slice D.
 export const uploaderRoleEnum = pgEnum("uploader_role", [
@@ -786,7 +795,12 @@ export const corrections = pgTable(
     submissionId: uuid("submission_id").notNull(),
     studentId: uuid("student_id").notNull(),
     status: correctionStatusEnum("status").default("draft").notNull(),
-    // Per-question verdicts (right/wrong/partial + comment). Editable pre-release.
+    // Output model: `marking` (verdict grid) or `language` (issue + rewrite).
+    // Defaults to `marking` — the pre-C.5 behaviour — so existing rows are inert.
+    mode: correctionModeEnum("mode").default("marking").notNull(),
+    // Per-item payload. Marking: {number,verdict,comment}. Language adds
+    // {issueType,label,original,suggestion}. jsonb — schemaless, no DB change to
+    // extend the shape (only the `mode` column above needs a migration).
     items: jsonb("items").$type<CorrectionItem[]>().default([]).notNull(),
     // The short feedback note in the tutor's voice, referencing the work.
     voicedNote: text("voiced_note"),
@@ -1142,3 +1156,4 @@ export type NewSubmission = typeof submissions.$inferInsert;
 export type Correction = typeof corrections.$inferSelect;
 export type NewCorrection = typeof corrections.$inferInsert;
 export type CorrectionStatus = (typeof correctionStatusEnum.enumValues)[number];
+export type CorrectionMode = (typeof correctionModeEnum.enumValues)[number];
