@@ -8,12 +8,12 @@ import {
   type WeeklyReport,
 } from "@/lib/llm/generate-report";
 import { FATIMA_VOICE } from "@/lib/llm/voice";
+import { getTenantVoice } from "@/lib/voice.server";
 import { weeklyStats, type ReportLesson, type WeeklyStats } from "@/lib/reports";
 import {
   draftWeeklyReportsForTenant,
   type DraftSummary,
 } from "@/lib/reports-draft";
-import type { VoiceSignature } from "@/lib/voice-types";
 
 function requireStaff(role: string): boolean {
   return ["owner", "admin", "tutor"].includes(role);
@@ -60,15 +60,9 @@ export async function generateWeeklyReport(input: {
   };
 
   // Tenant voice (fallback to the default until a tenant captures their own).
-  const { data: tenantRow } = await supabase
-    .from("tenants")
-    .select("voice_signature")
-    .eq("id", res.tenant.tenantId)
-    .single();
-  const captured = (
-    tenantRow as unknown as { voice_signature: VoiceSignature | null } | null
-  )?.voice_signature;
-  const voice = captured ?? FATIMA_VOICE;
+  // Drizzle path — `authenticated` has no column privilege on
+  // tenants.voice_signature (policies.sql §3). Staff-gated above.
+  const voice = (await getTenantVoice(res.tenant.tenantId)) ?? FATIMA_VOICE;
 
   // Lessons — RLS-scoped to what the caller may see for this student.
   const { data: lessonData } = await supabase

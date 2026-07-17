@@ -7,7 +7,7 @@ import {
   type PracticeSet,
 } from "@/lib/llm/generate-practice";
 import { FATIMA_VOICE } from "@/lib/llm/voice";
-import type { VoiceSignature } from "@/lib/voice-types";
+import { getTenantVoice } from "@/lib/voice.server";
 
 export async function generatePractice(input: {
   topic: string;
@@ -26,15 +26,9 @@ export async function generatePractice(input: {
   const supabase = await createClient();
 
   // Load this tenant's captured voice; fall back to the default if none yet.
-  const { data: tenantRow } = await supabase
-    .from("tenants")
-    .select("voice_signature")
-    .eq("id", res.tenant.tenantId)
-    .single();
-  const captured = (
-    tenantRow as unknown as { voice_signature: VoiceSignature | null } | null
-  )?.voice_signature;
-  const voice = captured ?? FATIMA_VOICE;
+  // Drizzle path — `authenticated` has no column privilege on
+  // tenants.voice_signature (policies.sql §3). Staff-gated above.
+  const voice = (await getTenantVoice(res.tenant.tenantId)) ?? FATIMA_VOICE;
 
   let studentName: string | undefined;
   let yearLevel: string | undefined;

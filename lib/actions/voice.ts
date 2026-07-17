@@ -2,7 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { resolveActiveTenant } from "@/lib/tenant";
-import { createClient } from "@/lib/supabase/server";
+import { setTenantVoice } from "@/lib/voice.server";
 import { extractVoiceSignature } from "@/lib/llm/extract-voice";
 import type { VoiceSignature } from "@/lib/voice-types";
 
@@ -50,12 +50,16 @@ export async function saveVoice(
     patterns: (voice.patterns ?? []).map((s) => s.trim()).filter(Boolean),
   };
 
-  const supabase = await createClient();
-  const { error } = await supabase
-    .from("tenants")
-    .update({ voice_signature: clean })
-    .eq("id", tenant.tenantId);
+  // Drizzle, not supabase-js: `authenticated` has no column privilege on
+  // tenants.voice_signature (policies.sql §3). Staff-gated above; tenant scoped
+  // explicitly, per the doc 06 §3 rule for the RLS-bypassing path.
+  try {
+    await setTenantVoice(tenant.tenantId, clean);
+  } catch (err) {
+    console.error("[voice] save failed", err);
+    return { ok: false, error: "Couldn't save your voice. Try again." };
+  }
 
   revalidatePath("/dashboard", "layout");
-  return { ok: !error, error: error?.message };
+  return { ok: true };
 }

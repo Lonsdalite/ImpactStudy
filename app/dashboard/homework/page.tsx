@@ -3,6 +3,7 @@ import Link from "next/link";
 import { createClient } from "@/lib/supabase/server";
 import { resolveActiveTenant } from "@/lib/tenant";
 import { signedUrls, SUBMISSIONS_BUCKET } from "@/lib/storage";
+import { getTenantVoice } from "@/lib/voice.server";
 import { nowMs, sinceMs } from "@/lib/perf";
 import { CorrectionUploader } from "@/components/dashboard/correction-uploader";
 import {
@@ -98,7 +99,7 @@ export default async function HomeworkPage() {
     { data: assignmentData },
     { data: correctionData },
     { data: pendingData },
-    { data: tenantRow },
+    capturedVoice,
     { data: correctedData },
   ] = await Promise.all([
     supabase
@@ -128,11 +129,10 @@ export default async function HomeworkPage() {
       .eq("tenant_id", tenant.tenantId)
       .order("created_at", { ascending: false })
       .limit(30),
-    supabase
-      .from("tenants")
-      .select("voice_signature")
-      .eq("id", tenant.tenantId)
-      .single(),
+    // Drizzle path — `authenticated` has no column privilege on
+    // tenants.voice_signature (policies.sql §3, Slice D). Still inside the
+    // parallel batch, so it costs no extra round-trip wall-clock (C.5 item d).
+    getTenantVoice(tenant.tenantId),
     // "Has a correction?" id-set for the pending queue. An explicit id set is
     // robust (a PostgREST reverse-embed silently returns empty for some
     // runtime rows). Folded into this parallel batch so it isn't a serial
@@ -147,8 +147,7 @@ export default async function HomeworkPage() {
   const students = (studentData ?? []) as unknown as StudentRow[];
   const assignments = (assignmentData ?? []) as unknown as AssignmentRow[];
   const corrections = (correctionData ?? []) as unknown as CorrectionRow[];
-  const hasVoice = !!(tenantRow as unknown as { voice_signature: unknown } | null)
-    ?.voice_signature;
+  const hasVoice = !!capturedVoice;
 
   // Uploader inputs.
   const uploaderStudents = students.map((s) => ({

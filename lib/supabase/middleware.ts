@@ -14,7 +14,11 @@ import { env } from "@/lib/env";
  */
 
 // Routes that require an authenticated user. Anything not here is public.
-const PROTECTED_PREFIXES = ["/dashboard", "/tenant-select"];
+// /portal is the student surface (Slice D) — same auth requirement; WHICH of the
+// two surfaces you belong on is decided by role in the layouts (a student is
+// bounced from /dashboard, staff/parents from /portal), because that needs a DB
+// round-trip for the membership and this runs on every request.
+const PROTECTED_PREFIXES = ["/dashboard", "/tenant-select", "/portal"];
 
 function isProtectedPath(pathname: string) {
   return PROTECTED_PREFIXES.some((p) => pathname.startsWith(p));

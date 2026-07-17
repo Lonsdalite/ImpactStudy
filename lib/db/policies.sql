@@ -44,6 +44,24 @@
 -- Magic-link signup for a brand-new user (e.g. a parent) must create the
 -- matching public.users row, or memberships/student_parents FKs have nothing to
 -- point at. SECURITY DEFINER so the trigger can write past RLS.
+--
+-- THE STALE-EMAIL GUARD (Slice D — found by the live probe, not by reading this).
+-- public.users has NO foreign key to auth.users (it only mirrors it), so deleting
+-- an auth user leaves its public.users row behind, still holding the email. Since
+-- public.users.email is UNIQUE, the next signup on that address then violates the
+-- EMAIL constraint — which `on conflict (id)` does not catch — so this trigger
+-- raised and Supabase returned an opaque 500 to the caller.
+--
+-- It goes from theoretical to routine in Slice D, because D is the first slice
+-- that DELETES auth users: revoke a student's login, try to reissue the same
+-- username, and account creation fails forever with "Couldn't create the login."
+--
+-- Any public.users row carrying new.email with a different id is stale BY
+-- CONSTRUCTION — auth.users.email is itself unique, so a live auth user with this
+-- address would be new.id. Deleting it (which cascades its equally-stale
+-- memberships) is therefore sound, and it self-heals rows orphaned before this
+-- guard existed. revokeStudentAccount also cleans up explicitly; this is the
+-- backstop that makes the invariant true no matter who does the deleting.
 create or replace function public.handle_new_user()
 returns trigger
 language plpgsql
@@ -51,6 +69,10 @@ security definer
 set search_path = ''
 as $$
 begin
+  delete from public.users
+   where email = new.email
+     and id <> new.id;
+
   insert into public.users (id, email, display_name, avatar_url)
   values (
     new.id,
@@ -107,10 +129,66 @@ as $$
   );
 $$;
 
+-- Which students.id rows the current user IS (Slice D — doc 26 §2D). The whole
+-- student-role authorisation model reduces to this one set: every student policy
+-- below is `student_id in (select public.current_student_ids())`.
+--
+-- Why that is tenant-coherent WITHOUT repeating a tenant predicate (unlike the
+-- parent policies, which must carry `sp.tenant_id = <table>.tenant_id`):
+--   * students.user_id is UNIQUE globally → one auth user ↔ at most one students
+--     row ↔ exactly one tenant. There is no "link table" to forge (that was
+--     P0-1's whole problem shape — student_parents is many-to-many, this is 1:1).
+--   * the join to memberships demands a `student` membership IN THAT SAME
+--     TENANT, so a stray user_id alone grants nothing.
+--   * every homework table carries B.5's composite FK
+--     (tenant_id, student_id) → students(tenant_id, id), so a row naming my
+--     student_id is PROVABLY in my student's tenant — the DB cannot represent
+--     otherwise.
+-- Net: "this row is mine" already implies "this row is in my tenant".
+create or replace function public.current_student_ids()
+returns setof uuid
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select s.id
+  from public.students s
+  join public.memberships m
+    on m.user_id = s.user_id
+   and m.tenant_id = s.tenant_id
+   and m.role = 'student'
+  where s.user_id = (select auth.uid())
+    and s.active;
+$$;
+
+-- Cast a path segment to uuid, or NULL if it isn't one. The storage policies
+-- match `(storage.foldername(name))[2]` against student ids, and a bare `::uuid`
+-- on a non-uuid segment raises — which would fail the WHOLE query (including
+-- staff's), not just skip the row. Legacy Slice-C objects are
+-- `${tenant}/${submissionId}/…` (segment 2 IS a uuid, just never a student id),
+-- but a stray/hand-uploaded key must degrade to "no match", never to an error.
+create or replace function public.safe_uuid(p_text text)
+returns uuid
+language sql
+immutable
+set search_path = ''
+as $$
+  select case
+    when p_text ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+      then p_text::uuid
+    else null
+  end;
+$$;
+
 revoke all on function public.current_tenant_ids() from public;
 revoke all on function public.is_tenant_staff(uuid) from public;
+revoke all on function public.current_student_ids() from public;
+revoke all on function public.safe_uuid(text) from public;
 grant execute on function public.current_tenant_ids() to authenticated;
 grant execute on function public.is_tenant_staff(uuid) to authenticated;
+grant execute on function public.current_student_ids() to authenticated;
+grant execute on function public.safe_uuid(text) to authenticated;
 
 -- ----------------------------------------------------------------------------
 -- 2. Enable RLS (idempotent — auto-RLS trigger already set it Day 1/2)
@@ -127,7 +205,28 @@ alter table public.tenant_corpus_subscriptions enable row level security;
 -- 3. Table grants to `authenticated` (PostgREST won't serve a table without
 --    a grant; RLS then filters which rows come back). anon stays locked out.
 -- ----------------------------------------------------------------------------
-grant select, update                 on public.tenants                     to authenticated;
+-- tenants: COLUMN-LEVEL grant (Slice D — doc 35b §5.1). `tenants_select_member`
+-- lets any member of the tenant read the row, and the row contains
+-- `voice_signature` — the pedagogy style guide, i.e. the moat, and the prompt we
+-- write parent notes and homework feedback with. RLS is ROW-level, and staff /
+-- parents / students all share the `authenticated` role, so no policy can hide a
+-- column from one of them. The moment a `student` membership exists, a child's
+-- account could `select voice_signature from tenants`. (Parents could already.)
+--
+-- Fixed at the strongest available layer: a column privilege. `authenticated`
+-- is simply not granted the column, so NOTHING on the PostgREST path can select
+-- it — no view to leak through, no policy to get wrong later, and it fails for
+-- staff too rather than pretending. Voice reads/writes moved to the Drizzle
+-- server path (lib/voice.server.ts), which connects as the Postgres role and
+-- filters tenant_id in code (doc 06 §3) — the same shape as the report drafter.
+--
+-- Re-granting `select` on the whole table anywhere below would silently undo
+-- this. The column list is deliberate; add new tenant columns to it explicitly.
+revoke select, update on public.tenants from authenticated;
+grant select (id, slug, display_name, brand_color, created_at)
+                                     on public.tenants                     to authenticated;
+grant update (slug, display_name, brand_color)
+                                     on public.tenants                     to authenticated;
 grant select, update                 on public.users                       to authenticated;
 grant select                         on public.memberships                 to authenticated;
 grant select, insert, update, delete on public.students                    to authenticated;
@@ -196,11 +295,20 @@ create policy memberships_select_self_or_staff on public.memberships
 -- Parent predicates everywhere carry `sp.tenant_id = <table>.tenant_id`
 -- (Slice B.5 / Fable P0-1): a parent link only grants reads INSIDE the link's
 -- own tenant, so a forged/cross-tenant link row can never widen visibility.
+-- Slice D adds the third arm: a student reads their OWN row (their name + year
+-- level — the portal greets them by name). current_student_ids() reads this very
+-- table, which is safe for the same reason is_tenant_staff() may read
+-- memberships from memberships' own policy: SECURITY DEFINER runs as the owner,
+-- and an owner bypasses RLS, so there is no recursion. Using the helper (rather
+-- than a bare `user_id = auth.uid()`) keeps ONE definition of "is a student" —
+-- so a deactivated student, or a lingering user_id with no `student` membership,
+-- is locked out here exactly as it is everywhere else.
 drop policy if exists students_select_staff_or_parent on public.students;
 create policy students_select_staff_or_parent on public.students
   for select to authenticated
   using (
     public.is_tenant_staff(tenant_id)
+    or id in (select public.current_student_ids())
     or exists (
       select 1
       from public.student_parents sp
@@ -334,11 +442,22 @@ create policy subjects_delete_staff on public.subjects
   for delete to authenticated
   using (public.is_tenant_staff(tenant_id));
 
--- price_list_items: members read their tenant's catalog; staff write.
+-- price_list_items: STAFF ONLY (Slice D — doc 35b §5.1). This was
+-- `..._select_member` on current_tenant_ids(), which meant "any member of the
+-- tenant, any role". That was survivable while the only non-staff role was a
+-- parent; it is NOT survivable with a `student` membership, because doc 26 §2D
+-- locks students out of billing — "NEVER billing" — and the price catalog IS
+-- the billing model (every year × subject × mode → hourly rate).
+--
+-- Staff-only rather than staff-or-parent because no parent surface reads this:
+-- a parent's balance comes from parent_lessons.amount_cents (the posted fee),
+-- never from the catalog. The two readers are /dashboard/pricing (staff-only
+-- page) and resolveEnrollmentPrice in actions/enrollments.ts (requireStaff).
 drop policy if exists price_list_items_select_member on public.price_list_items;
-create policy price_list_items_select_member on public.price_list_items
+drop policy if exists price_list_items_select_staff on public.price_list_items;
+create policy price_list_items_select_staff on public.price_list_items
   for select to authenticated
-  using (tenant_id in (select public.current_tenant_ids()));
+  using (public.is_tenant_staff(tenant_id));
 
 drop policy if exists price_list_items_insert_staff on public.price_list_items;
 create policy price_list_items_insert_staff on public.price_list_items
@@ -552,13 +671,28 @@ create policy reports_delete_staff on public.reports
   using (public.is_tenant_staff(tenant_id));
 
 -- ----------------------------------------------------------------------------
--- 11d. Homework & AI correction (Slice C — doc 26 §2C):
---      worksheets, assignments, submissions, corrections.
---      Staff write tenant-wide. A parent is low-touch (§2D): read-only on their
---      own child's assignments + submissions for context, and on a correction
---      ONLY once it's RELEASED (mirrors the reports "sent-only" trust gate).
---      Worksheets are the tenant's private library — staff only. The `student`
---      role stays out until Slice D.
+-- 11d. Homework & AI correction (Slice C — doc 26 §2C) + the STUDENT role
+--      (Slice D — doc 26 §2D): worksheets, assignments, submissions, corrections.
+--
+--      This is where the locked three-way split (§2D) actually lives. Read it as
+--      one table of who-sees-what rather than four separate policies:
+--
+--        table        staff            student                  parent
+--        ----------   --------------   ----------------------   -------------------
+--        worksheets   all (library)    only ones ASSIGNED       none
+--        assignments  all              own queue (the inbox)    own child's, read-only
+--        submissions  all + write      own + INSERT own work    own child's, read-only
+--        corrections  all incl. draft  own, RELEASED only,      voiced_note only,
+--                                      incl. items + stats      released only, via
+--                                                               parent_corrections
+--
+--      Three invariants hold across every row above:
+--        1. release-gating — nothing AI-drafted reaches a student or a parent
+--           until Fatima releases it (the same spine as reports' `sent`);
+--        2. grades are for staff + the student, never the parent (warmth thesis);
+--        3. billing is for staff alone — students appear in NO policy on
+--           lessons / payments / enrollments / price_list_items / reports, which
+--           is what makes "NEVER billing" a DB fact rather than a UI convention.
 -- ----------------------------------------------------------------------------
 alter table public.worksheets   enable row level security;
 alter table public.assignments  enable row level security;
@@ -570,11 +704,28 @@ grant select, insert, update, delete on public.assignments  to authenticated;
 grant select, insert, update, delete on public.submissions  to authenticated;
 grant select, insert, update, delete on public.corrections  to authenticated;
 
--- worksheets: staff-only (the tenant's private assignable library).
+-- worksheets: staff read the whole library; a STUDENT reads ONLY a worksheet
+-- that is actually assigned to them (Slice D — doc 26 §2D "worksheets ONLY for
+-- worksheets assigned to them"). The library is the tenant's private curation —
+-- browsing it would leak what every other student is being set, and the order
+-- she's planning. `archived` assignments don't grant access (the work was
+-- withdrawn). Note the join is gated by current_student_ids(), so the
+-- assignment's tenant is provably the student's tenant (composite FK).
 drop policy if exists worksheets_select_staff on public.worksheets;
-create policy worksheets_select_staff on public.worksheets
+drop policy if exists worksheets_select_staff_or_assigned on public.worksheets;
+create policy worksheets_select_staff_or_assigned on public.worksheets
   for select to authenticated
-  using (public.is_tenant_staff(tenant_id));
+  using (
+    public.is_tenant_staff(tenant_id)
+    or exists (
+      select 1
+      from public.assignments a
+      where a.worksheet_id = public.worksheets.id
+        and a.tenant_id = public.worksheets.tenant_id
+        and a.status <> 'archived'
+        and a.student_id in (select public.current_student_ids())
+    )
+  );
 
 drop policy if exists worksheets_insert_staff on public.worksheets;
 create policy worksheets_insert_staff on public.worksheets
@@ -592,12 +743,14 @@ create policy worksheets_delete_staff on public.worksheets
   for delete to authenticated
   using (public.is_tenant_staff(tenant_id));
 
--- assignments: staff full write; a parent reads their own child's queue.
+-- assignments: staff full write; a parent reads their own child's queue; a
+-- STUDENT reads their own queue — this is the portal inbox (Slice D).
 drop policy if exists assignments_select_staff_or_parent on public.assignments;
 create policy assignments_select_staff_or_parent on public.assignments
   for select to authenticated
   using (
     public.is_tenant_staff(tenant_id)
+    or student_id in (select public.current_student_ids())
     or exists (
       select 1
       from public.student_parents sp
@@ -623,12 +776,14 @@ create policy assignments_delete_staff on public.assignments
   for delete to authenticated
   using (public.is_tenant_staff(tenant_id));
 
--- submissions: staff full write; a parent reads their own child's submissions.
+-- submissions: staff full write; a parent reads their own child's submissions;
+-- a STUDENT reads their own.
 drop policy if exists submissions_select_staff_or_parent on public.submissions;
 create policy submissions_select_staff_or_parent on public.submissions
   for select to authenticated
   using (
     public.is_tenant_staff(tenant_id)
+    or student_id in (select public.current_student_ids())
     or exists (
       select 1
       from public.student_parents sp
@@ -643,6 +798,48 @@ create policy submissions_insert_staff on public.submissions
   for insert to authenticated
   with check (public.is_tenant_staff(tenant_id));
 
+-- THE student write path — the only INSERT a student may perform anywhere in the
+-- schema (doc 26 §2D: "uploads come from the student account"; a parent may
+-- operate it for a young child, which is why there is no parent-upload UI and no
+-- parent INSERT policy). C cut this seam already: uploader_role is polymorphic,
+-- so D fills in the 'student' arm rather than reworking C.
+--
+-- The with-check pins all three of who/as-what/for-whom, so a student's own JWT
+-- cannot forge a submission for another student or launder one in as the tutor's:
+--   * student_id ∈ current_student_ids()  → only for themselves;
+--   * uploader_role = 'student'           → can't impersonate a tutor upload
+--                                           (which is what the correction
+--                                           workstation trusts as gatekept);
+--   * uploaded_by = auth.uid()            → the record names the real account.
+-- tenant_id needs no predicate here: the composite FK (tenant_id, student_id) →
+-- students(tenant_id, id) makes a mismatched tenant unrepresentable (B.5 P0-1).
+drop policy if exists submissions_insert_student on public.submissions;
+create policy submissions_insert_student on public.submissions
+  for insert to authenticated
+  with check (
+    student_id in (select public.current_student_ids())
+    and uploader_role = 'student'
+    and uploaded_by = (select auth.uid())
+  );
+
+-- A student may take back work they just handed in, but ONLY while it is
+-- untouched — once a correction row exists, the tutor has begun (or finished)
+-- marking it, and deleting it out from under her would erase her work and, if
+-- released, rewrite the record. This is what backs the portal's toast-with-undo
+-- on upload (holding the UX bar); staff keep the unconditional discard.
+drop policy if exists submissions_delete_student on public.submissions;
+create policy submissions_delete_student on public.submissions
+  for delete to authenticated
+  using (
+    student_id in (select public.current_student_ids())
+    and uploader_role = 'student'
+    and not exists (
+      select 1
+      from public.corrections c
+      where c.submission_id = public.submissions.id
+    )
+  );
+
 drop policy if exists submissions_update_staff on public.submissions;
 create policy submissions_update_staff on public.submissions
   for update to authenticated
@@ -654,15 +851,34 @@ create policy submissions_delete_staff on public.submissions
   for delete to authenticated
   using (public.is_tenant_staff(tenant_id));
 
--- corrections: STAFF ONLY on the base table (Slice B.5 / Fable §1 P1). The old
--- released-row parent policy served whole rows — `items` (per-question verdicts)
--- and `stats` (right/wrong tally) are grades, and doc 26 §2D says parents get
--- feedback, NEVER grades. Parents read released feedback via the column-safe
--- public.parent_corrections view (§11f below): voiced_note + released_at only.
+-- corrections: staff, plus the STUDENT the work belongs to — but only once it is
+-- RELEASED. Not parents: the old released-row parent policy served whole rows,
+-- and `items` (per-question verdicts) + `stats` (the tally) are GRADES, which
+-- doc 26 §2D keeps from parents (they read voiced_note via the column-safe
+-- public.parent_corrections view, §11f).
+--
+-- This is the three-way split at its sharpest, on one table:
+--   staff   → everything, draft included (she IS the author);
+--   student → their own, released only, INCLUDING items + stats — "score stays
+--             tutor-side AND student-side" (§2D). The student is the one person
+--             who should see their own marks; withholding them would make the
+--             portal pointless.
+--   parent  → voiced_note only, released only, via the view. Never a grade —
+--             "never broadcast low performance to parents" (the warmth thesis).
+-- The `released` gate is the same trust spine as reports' `sent`: an AI draft
+-- Fatima hasn't reviewed must not reach a child either. Enforced here at the DB,
+-- so a student hitting PostgREST directly gets nothing.
 drop policy if exists corrections_select_staff_or_parent on public.corrections;
-create policy corrections_select_staff_or_parent on public.corrections
+drop policy if exists corrections_select_staff_or_student on public.corrections;
+create policy corrections_select_staff_or_student on public.corrections
   for select to authenticated
-  using (public.is_tenant_staff(tenant_id));
+  using (
+    public.is_tenant_staff(tenant_id)
+    or (
+      status = 'released'
+      and student_id in (select public.current_student_ids())
+    )
+  );
 
 drop policy if exists corrections_insert_staff on public.corrections;
 create policy corrections_insert_staff on public.corrections
@@ -897,12 +1113,14 @@ grant execute on function public.undo_reschedule(uuid, uuid, boolean, public.les
 
 -- ----------------------------------------------------------------------------
 -- 11e. Supabase Storage — private buckets for worksheet + submission files.
---      Path convention: `${tenant_id}/${...}` — the FIRST path segment is the
---      tenant uuid, so a single predicate scopes every object to its tenant's
---      staff. Uploads/reads happen on the supabase-js path (RLS-enforced);
---      the app hands out short-lived signed URLs, never public links.
---      Parent/student read of submission IMAGES is deferred to Slice D (in C a
---      parent only sees the released text feedback, not the scanned page).
+--      Path convention: segment 1 is ALWAYS the tenant uuid, so a single
+--      predicate scopes every object to its tenant's staff. Slice D adds a
+--      second segment to submissions — `${tenantId}/${studentId}/…` — so a
+--      student's own work is expressible as a path predicate too (doc 35b §5.4).
+--      Uploads/reads happen on the supabase-js path (RLS-enforced); the app
+--      hands out short-lived signed URLs, never public links.
+--      A PARENT still gets no object access at all: they read the released
+--      voiced_note, never the scanned page of their child's work.
 -- ----------------------------------------------------------------------------
 insert into storage.buckets (id, name, public)
 values ('worksheets', 'worksheets', false), ('submissions', 'submissions', false)
@@ -914,12 +1132,88 @@ create policy homework_objects_staff_all on storage.objects
   for all to authenticated
   using (
     bucket_id in ('worksheets', 'submissions')
-    and public.is_tenant_staff(((storage.foldername(name))[1])::uuid)
+    and public.is_tenant_staff(public.safe_uuid((storage.foldername(name))[1]))
   )
   with check (
     bucket_id in ('worksheets', 'submissions')
-    and public.is_tenant_staff(((storage.foldername(name))[1])::uuid)
+    and public.is_tenant_staff(public.safe_uuid((storage.foldername(name))[1]))
   );
+
+-- SUBMISSIONS, student side (Slice D — doc 35b §5.4). The single `${tenantId}`
+-- staff predicate can't express "this student's own work", so the submissions
+-- convention gains a second segment: `${tenantId}/${studentId}/${submissionId}/
+-- ${file}`. Segment 2 is the owner, and one predicate scopes reads AND writes.
+--
+-- Legacy note: Slice-C objects are `${tenantId}/${submissionId}/…`. They keep
+-- working — the STAFF policy only reads segment 1, which is unchanged — and this
+-- student policy simply never matches them (a submissionId is a uuid, so
+-- safe_uuid returns it, but it is not in current_student_ids() → no rows). So
+-- there is no path rewrite and no object migration: old objects stay staff-only,
+-- new ones are student-reachable. Fatima's real uploads are untouched.
+--
+-- WORKSHEETS deliberately get NO student storage policy. "Is this worksheet
+-- assigned to me?" is a JOIN (assignments → worksheets), not a fact recoverable
+-- from an object key, and encoding it in the path would mean copying a file per
+-- student. Students receive worksheet bytes only via signedWorksheetUrlForStudent
+-- (lib/actions/portal.ts), which checks the assignment first. Per doc 35b §5.4.
+drop policy if exists submission_objects_student_read on storage.objects;
+create policy submission_objects_student_read on storage.objects
+  for select to authenticated
+  using (
+    bucket_id = 'submissions'
+    and public.safe_uuid((storage.foldername(name))[2])
+        in (select public.current_student_ids())
+  );
+
+drop policy if exists submission_objects_student_write on storage.objects;
+create policy submission_objects_student_write on storage.objects
+  for insert to authenticated
+  with check (
+    bucket_id = 'submissions'
+    and public.safe_uuid((storage.foldername(name))[2])
+        in (select public.current_student_ids())
+  );
+
+-- Deleting their own object backs the upload undo (see submissions_delete_student
+-- above). Bounded by the same path predicate: their own folder, nothing else.
+drop policy if exists submission_objects_student_delete on storage.objects;
+create policy submission_objects_student_delete on storage.objects
+  for delete to authenticated
+  using (
+    bucket_id = 'submissions'
+    and public.safe_uuid((storage.foldername(name))[2])
+        in (select public.current_student_ids())
+  );
+
+-- ----------------------------------------------------------------------------
+-- 11h. audit_log + student_login_attempts (Slice D — doc 35b §5.5)
+--     The audit log stops being optional the day the tutor holds credentials for
+--     other people's children. Both tables are written ONLY from server-side
+--     code on the Drizzle path (which connects as the Postgres role and bypasses
+--     RLS by design, doc 06 §3) — so neither gets a write grant here.
+-- ----------------------------------------------------------------------------
+alter table public.audit_log             enable row level security;
+alter table public.student_login_attempts enable row level security;
+
+-- Staff may READ their own tenant's trail (so the record is answerable to the
+-- person accountable for it). No insert/update/delete grant to `authenticated`
+-- at all: append-only isn't a policy here, it's the absence of a privilege —
+-- there is no PostgREST path that can rewrite or erase history.
+grant select on public.audit_log to authenticated;
+
+drop policy if exists audit_log_select_staff on public.audit_log;
+create policy audit_log_select_staff on public.audit_log
+  for select to authenticated
+  using (public.is_tenant_staff(tenant_id));
+
+-- student_login_attempts gets NO grant of any kind. It is keyed by username and
+-- consulted BEFORE anyone is authenticated, so exposing it on the Data API would
+-- hand out a username oracle ("which handles exist / are locked") — exactly what
+-- the deterministic synthetic-email scheme otherwise avoids. RLS is enabled to
+-- satisfy the RLS-on assertion; the lack of a grant is what actually shuts it.
+-- (Belt and braces: no grant AND no policy = no rows on that path, ever.)
+
+-- ----------------------------------------------------------------------------
 
 -- ----------------------------------------------------------------------------
 -- 12. Tell PostgREST to reload its schema cache (so new grants/tables show up

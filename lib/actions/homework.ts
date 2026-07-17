@@ -4,6 +4,7 @@ import { revalidatePath } from "next/cache";
 import { resolveActiveTenant } from "@/lib/tenant";
 import { createClient } from "@/lib/supabase/server";
 import { FATIMA_VOICE } from "@/lib/llm/voice";
+import { getTenantVoice } from "@/lib/voice.server";
 import { gradeSubmission, type GradePage } from "@/lib/llm/grade-submission";
 import { downloadBase64, SUBMISSIONS_BUCKET } from "@/lib/storage";
 import {
@@ -14,7 +15,6 @@ import {
   type SubmissionPage,
 } from "@/lib/homework-types";
 import { MAX_SUBMISSION_PAGES } from "@/lib/homework";
-import type { VoiceSignature } from "@/lib/voice-types";
 
 /**
  * Homework + AI-correction server actions (Slice C). All reads/writes ride the
@@ -395,15 +395,10 @@ export async function draftCorrection(input: {
     };
   }
 
-  // Tenant voice (fall back to the default until captured).
-  const { data: tenantRow } = await supabase
-    .from("tenants")
-    .select("voice_signature")
-    .eq("id", tenant.tenantId)
-    .single();
-  const voice =
-    (tenantRow as unknown as { voice_signature: VoiceSignature | null } | null)
-      ?.voice_signature ?? FATIMA_VOICE;
+  // Tenant voice (fall back to the default until captured). Drizzle path —
+  // `authenticated` has no column privilege on tenants.voice_signature
+  // (policies.sql §3). Staff-gated above.
+  const voice = (await getTenantVoice(tenant.tenantId)) ?? FATIMA_VOICE;
 
   // Pull the page bytes from Storage. Skip any that can't be read (e.g. a seeded
   // placeholder with no real file) rather than failing the whole draft.

@@ -13,11 +13,21 @@
  *   - 6 enrollments (incl. a group + multi-enrollment student)
  *   - ~5 weeks of twice-weekly lessons billed hours × rate
  *   - 3 platform_baseline corpus sources + 1 tenant_uploaded + 3 subscriptions
+ *   - 1 student portal account (Amara — username + password, Slice D)
  *
  * TEST IDENTITIES use Gmail plus-addressing off ONE inbox (SEED_BASE_EMAIL) so
  * you can magic-link in as every role from your own inbox and verify RLS.
  *
  * Writes go via the SERVICE-ROLE key + Drizzle (both bypass RLS).
+ *
+ * ⚠️  DEV ONLY — NEVER RUN THIS AGAINST PROD (standing rule since Slice C.5).
+ * Production now holds Fatima's REAL students, lessons and homework. This script
+ * CLEARS the tenant's tables before re-inserting, so a single run against prod
+ * deletes her actual work. The "re-seed, don't migrate" rule that governed
+ * A→B.5 is retired for prod: schema changes ship as data-preserving migrations
+ * (db:generate → review → db:migrate). Point this at a scratch DB only.
+ * Real student portal accounts on prod are created through the app's own
+ * credential flow on the student record, not here.
  */
 import { config } from "dotenv";
 config({ path: ".env.local" });
@@ -30,6 +40,7 @@ import * as schema from "./schema";
 import { FATIMA_VOICE } from "../voice-types";
 import { tallyItems, type CorrectionItem, type SubmissionPage } from "../homework-types";
 import { sydneyWallToUtc } from "../calendar";
+import { emailForUsername } from "../student-credentials";
 
 // ---------- env ----------
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -139,12 +150,21 @@ const admin = createClient(SUPABASE_URL, SERVICE_KEY, {
 });
 
 // ---------- helpers ----------
+/**
+ * `password` (Slice D): staff/parents sign in by magic link and have none. A
+ * seeded STUDENT does — the portal is username+password (doc 26 §2D) — so pass
+ * one for those. On the found-existing path we RE-SET it, which is what keeps the
+ * seed idempotent in the way that matters: a second `pnpm db:seed` must leave the
+ * documented demo password actually working, not silently keep an older one.
+ */
 async function getOrCreateAuthUser(
   email: string,
   displayName: string,
+  password?: string,
 ): Promise<User> {
   const { data, error } = await admin.auth.admin.createUser({
     email,
+    password,
     email_confirm: true,
     user_metadata: { display_name: displayName },
   });
@@ -158,7 +178,12 @@ async function getOrCreateAuthUser(
       const found = list.users.find(
         (u) => u.email?.toLowerCase() === email.toLowerCase(),
       );
-      if (found) return found;
+      if (found) {
+        if (password) {
+          await admin.auth.admin.updateUserById(found.id, { password });
+        }
+        return found;
+      }
       if (list.users.length < 200) break;
     }
   }
@@ -499,11 +524,42 @@ async function main() {
   ]);
 
   console.log("Seeded Slice C: 3 worksheets, 4 assignments, 4 submissions, 3 corrections (1 language mode).");
+
+  // ---------- 13. Slice D — a demoable student portal account ----------
+  // DEV ONLY, like the whole seeder (see the header). On prod, student accounts
+  // are created through the app's own credential flow on the student record —
+  // never here.
+  //
+  // Amara because she's the fullest student: assignments across the pipeline,
+  // a released correction to read, and a parent (parent1) to check the
+  // three-way split against on the same child.
+  const studentUsername = "amara101";
+  const studentPassword = "maple-river-42"; // fixed → the seed stays idempotent
+  const studentAuth = await getOrCreateAuthUser(
+    emailForUsername(studentUsername),
+    "Amara",
+    studentPassword,
+  );
+  await upsertUserRow(studentAuth, "Amara");
+  await db
+    .insert(schema.memberships)
+    .values({ tenantId: TENANT_ID, userId: studentAuth.id, role: "student" })
+    .onConflictDoNothing();
+  await db
+    .update(schema.students)
+    .set({ userId: studentAuth.id, username: studentUsername })
+    .where(eq(schema.students.id, ST.amara));
+  console.log("Seeded Slice D: 1 student portal account (Amara).");
+
   console.log("\n✅ Seed complete.\n");
   console.log("Log in (magic link) to verify RLS:");
   console.log(`  OWNER  ${ownerEmail}   → all 4 students, 7 enrollments, weekly calendar`);
   console.log(`  PARENT ${parent1Email} → Amara + Bilal only`);
   console.log(`  PARENT ${parent2Email} → Chloe only`);
+  console.log("\nStudent portal (/login/student — username + password, no email):");
+  console.log(`  STUDENT ${studentUsername} / ${studentPassword} → Amara's homework only`);
+  console.log("  Check: she sees her own inbox + RELEASED feedback, and cannot");
+  console.log("  reach billing or another student (try /dashboard → bounced to /portal).");
   console.log("\nMath check: Amara Maths group 90min @ $40/hr = $60/session.");
   console.log("Calendar demo: Wed 16:00 = Amara + Chloe Maths group (cluster);");
   console.log("               Mon = Amara Physics 15:30 vs Dev Chemistry 16:00 (conflict).\n");

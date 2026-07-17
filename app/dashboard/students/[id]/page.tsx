@@ -14,6 +14,7 @@ import {
 import { BillingSettingsForm } from "@/components/dashboard/billing-settings-form";
 import { UndoPaymentButton } from "@/components/dashboard/undo-payment-button";
 import { StudentAdmin } from "@/components/dashboard/student-admin";
+import { StudentPortalAccount } from "@/components/dashboard/student-portal-account";
 import {
   EnrollmentsManager,
   type EnrollmentRow,
@@ -60,6 +61,8 @@ interface StudentRow {
   billing_cycle: BillingCycle;
   billing_anchor: string | null;
   created_at: string;
+  /** Their portal login handle; null until the tutor provisions one (Slice D). */
+  username: string | null;
 }
 interface LessonQueryRow {
   date: string;
@@ -141,7 +144,7 @@ export default async function StudentDetailPage({
   const { data: studentData } = await supabase
     .from("students")
     .select(
-      "id, first_name, last_name, year_level, active, billing_cycle, billing_anchor, created_at",
+      "id, first_name, last_name, year_level, active, billing_cycle, billing_anchor, created_at, username",
     )
     .eq("id", id)
     .single();
@@ -486,6 +489,18 @@ export default async function StudentDetailPage({
             </ul>
           </div>
         )}
+
+        {/* Portal login — staff only. Sits next to the other account-level
+            controls (archive/delete) rather than up with the homework: it's
+            about the student's ACCESS, not their work. */}
+        {isStaff ? (
+          <StudentPortalAccount
+            studentId={student.id}
+            studentName={fullName}
+            firstName={student.first_name}
+            username={student.username}
+          />
+        ) : null}
 
         {isStaff ? (
           <StudentAdmin

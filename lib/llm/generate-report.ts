@@ -3,6 +3,7 @@ import "server-only";
 import { renderVoice } from "@/lib/llm/voice";
 import type { VoiceSignature } from "@/lib/voice-types";
 import type { WeeklyStats } from "@/lib/reports";
+import type { Diligence } from "@/lib/diligence";
 import { shortDate } from "@/lib/billing";
 
 /**
@@ -32,6 +33,9 @@ export async function generateWeeklyReport(input: {
   yearLevel?: string;
   parentName?: string;
   stats: WeeklyStats;
+  /** Homework effort for the same window (Slice D — doc 26 §2D). Optional so a
+   *  caller with no homework data simply omits the fact. */
+  diligence?: Diligence;
 }): Promise<WeeklyReport> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
@@ -59,6 +63,18 @@ export async function generateWeeklyReport(input: {
       `Attendance so far: ${stats.streak} sessions attended and counting (all-time).`,
     );
   }
+  // Homework EFFORT (Slice D — doc 26 §2D). A count of what came back, never a
+  // score: the model is handed "completed 4 of 5", never "got 12/18". That
+  // asymmetry is the warmth thesis in the fact sheet itself — the note cannot
+  // broadcast a child's poor marks to their parent if the marks were never in
+  // the prompt. (`set === 0` → the fact is simply absent; no homework set isn't
+  // a fact about the child.)
+  if (input.diligence && input.diligence.set > 0) {
+    const d = input.diligence;
+    facts.push(
+      `Homework: completed ${d.completed} of ${d.set} worksheet(s) set this week. This is an EFFORT count (handed in), NOT a score.`,
+    );
+  }
   if (stats.attendedSessions.length > 0) {
     facts.push(
       `Days attended: ${stats.attendedSessions.map((s) => shortDate(s.date)).join(", ")}.`,
@@ -83,6 +99,7 @@ export async function generateWeeklyReport(input: {
     "- Use ONLY the facts provided below. Never invent topics covered, marks, scores, behaviours, or events.",
     "- If there are no lesson notes, keep it about attendance, effort and encouragement — do not fabricate what was studied.",
     "- Do not mention money, fees, invoices or billing. This note is about progress only.",
+    "- NEVER state or imply a mark, score, grade, or how many answers were right/wrong — you are not given them, and they are not for the parent. Homework is EFFORT only: how much was handed in.",
     "- Be concise: 2–4 short sentences in the body. Warm, specific to the facts, never generic filler.",
     "- Address the parent about their child by first name. Refer to the child in the third person.",
     "- Output ONLY a JSON object, no markdown fences, exactly this shape:",
