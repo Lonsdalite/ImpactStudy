@@ -168,7 +168,12 @@ export function CorrectionUploader({
         // Shrink big photos before upload — cuts both storage and grading
         // tokens (Claude downscales anyway). PDFs pass through untouched.
         const f = await downscaleImage(pages[i].file);
-        const path = `${tenantId}/${uploadId}/${i}-${safeName(f.name)}`;
+        // `${tenantId}/${studentId}/${uploadId}/…` — segment 2 is the owning
+        // student (Slice D). It's what the student storage policy matches on,
+        // so a child can see the page Fatima photographed of THEIR work and
+        // nothing else. Slice-C objects (no student segment) keep working:
+        // the staff policy only ever reads segment 1.
+        const path = `${tenantId}/${studentId}/${uploadId}/${i}-${safeName(f.name)}`;
         const { error } = await supabase.storage
           .from(SUBMISSIONS_BUCKET)
           .upload(path, f, { contentType: f.type || undefined, upsert: false });

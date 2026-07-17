@@ -20,6 +20,16 @@ export default async function DashboardLayout({
     redirect("/tenant-select");
   }
 
+  // A student never belongs on the staff/parent dashboard (Slice D). ONE choke
+  // point, deliberately: the alternative is remembering to staff-gate a dozen
+  // pages and every future one. RLS is the real boundary — a student's JWT reads
+  // nothing from lessons/payments/enrollments/price_list_items, so /dashboard/
+  // billing would render empty rather than leak — but "provably unreachable"
+  // should not have to mean "renders an empty billing page at a child".
+  if (result.status === "ok" && result.tenant.role === "student") {
+    redirect("/portal");
+  }
+
   if (result.status === "none") {
     return (
       <main className="flex flex-1 items-center justify-center px-6 py-16">

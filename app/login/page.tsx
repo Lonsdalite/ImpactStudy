@@ -52,6 +52,18 @@ export default async function LoginPage({ searchParams }: LoginPageProps) {
         <p className="text-xs text-center text-brand-ink/50">
           New here? Same form — first sign-in creates your account.
         </p>
+
+        {/* Students don't have an inbox to magic-link to (doc 26 §2D) — they get
+            a tutor-issued username + password on a separate flow. */}
+        <p className="text-center text-xs text-brand-ink/50">
+          Are you a student?{" "}
+          <Link
+            href="/login/student"
+            className="underline underline-offset-4 hover:text-brand-plum-mid"
+          >
+            Sign in with your username
+          </Link>
+        </p>
       </div>
     </main>
   );

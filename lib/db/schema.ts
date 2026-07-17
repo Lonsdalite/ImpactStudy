@@ -165,6 +165,29 @@ export const students = pgTable(
     // The join key into the price catalog (price_list_items). e.g. 'Y6'.
     yearLevel: text("year_level"), // 'Y3', 'Y4', etc.
     active: boolean("active").default(true).notNull(),
+    // ---------- portal identity (Slice D — doc 26 §2D) ----------
+    // The auth user behind this student's portal login. NULL until the tutor
+    // provisions one (no public self-signup — the tutor creates the account,
+    // parent in the loop; minors / Australian Privacy Principles).
+    //
+    // GLOBALLY unique, and that is the whole tenant-coherence argument: one auth
+    // user maps to exactly ONE students row, so it maps to exactly one tenant.
+    // Every homework table already carries the B.5 composite FK
+    // (tenant_id, student_id) → students(tenant_id, id), so "this row is mine"
+    // (student_id ∈ current_student_ids()) implies "this row is in my tenant" —
+    // a cross-tenant student link is unrepresentable, same as P0-1's parent fix.
+    // SET NULL on user delete: revoking a login must never delete the student.
+    userId: uuid("user_id")
+      .unique()
+      .references(() => users.id, { onDelete: "set null" }),
+    // The student's login handle. GLOBALLY unique because the synthetic auth
+    // email is derived from it deterministically (`${username}@students.
+    // impactstudy.invalid`, RFC 2606 reserved → never deliverable), which lets
+    // sign-in resolve username → email with NO lookup and no anon-readable
+    // username table to enumerate. PRIVACY: generated from a nickname / first
+    // name only, never a full legal name (doc 35e §1 — minimise minors' PII),
+    // and it is the handle used in AI-prompt text.
+    username: text("username").unique(),
     // Billing cadence + the date cycles are counted from (their start/join
     // date). Together these let the app compute each student's current period
     // and next-due date — no two students need the same cycle.
@@ -836,6 +859,67 @@ export const corrections = pgTable(
   ],
 );
 
+// ---------- audit_log (Slice D — non-optional the day we hold minors' creds) ----------
+// doc 06 §6 promised an audit log; doc 35b §5.5 made it a hard requirement for
+// Slice D: the tutor provisions and resets PASSWORDS FOR CHILDREN via the
+// service-role admin API, and a privileged action with no record is not an
+// action anyone can answer for later.
+//
+// Append-only by construction: written ONLY from server-side code on the Drizzle
+// path, and `authenticated` gets SELECT (staff, own tenant) but NO insert/update/
+// delete grant — so nothing on the PostgREST path can write or rewrite history.
+// `actor_user_id` is the staff member who did it; `meta` never holds a
+// credential (we log THAT a password was set, never the password).
+export const auditLog = pgTable(
+  "audit_log",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    // Who performed it. SET NULL (not cascade): deleting a user must never
+    // erase the record of what they did.
+    actorUserId: uuid("actor_user_id").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    action: text("action").notNull(), // 'student_account.create' | '.reset_password' | '.revoke' | 'student_login.locked'
+    targetType: text("target_type"), // 'student'
+    targetId: uuid("target_id"), // soft ref — survives the target's deletion
+    meta: jsonb("meta").$type<Record<string, unknown>>().default({}).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (t) => [
+    index("audit_log_tenant_idx").on(t.tenantId),
+    index("audit_log_created_idx").on(t.createdAt),
+    index("audit_log_target_idx").on(t.targetId),
+  ],
+);
+
+// ---------- student_login_attempts (Slice D — doc 35b §5.5 rate limiting) ----------
+// "Memorable passwords for children are weak by design" — so the sign-in path
+// needs a lockout or the generator's own friendliness becomes the attack.
+// Keyed by username (the only thing a caller supplies before authenticating);
+// NOT tenant-scoped, because usernames are global and the check must happen
+// BEFORE we know who — or what tenant — the caller claims to be.
+//
+// Server-side only: no grants to `authenticated` at all (see policies.sql §13),
+// so the table is invisible on the PostgREST path and can't be probed for which
+// usernames exist.
+export const studentLoginAttempts = pgTable(
+  "student_login_attempts",
+  {
+    username: text("username").primaryKey(),
+    failedCount: integer("failed_count").default(0).notNull(),
+    lockedUntil: timestamp("locked_until", { withTimezone: true }),
+    lastAttemptAt: timestamp("last_attempt_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (t) => [index("student_login_attempts_locked_idx").on(t.lockedUntil)],
+);
+
 // ---------- relations ----------
 // Drizzle relations API for ergonomic joins from query builder.
 
@@ -1022,6 +1106,17 @@ export const usersRelations = relations(users, ({ many }) => ({
   parentLinks: many(studentParents),
 }));
 
+export const auditLogRelations = relations(auditLog, ({ one }) => ({
+  tenant: one(tenants, {
+    fields: [auditLog.tenantId],
+    references: [tenants.id],
+  }),
+  actor: one(users, {
+    fields: [auditLog.actorUserId],
+    references: [users.id],
+  }),
+}));
+
 export const membershipsRelations = relations(memberships, ({ one }) => ({
   tenant: one(tenants, {
     fields: [memberships.tenantId],
@@ -1037,6 +1132,11 @@ export const studentsRelations = relations(students, ({ one, many }) => ({
   tenant: one(tenants, {
     fields: [students.tenantId],
     references: [tenants.id],
+  }),
+  // The portal auth account, once the tutor provisions one (Slice D).
+  user: one(users, {
+    fields: [students.userId],
+    references: [users.id],
   }),
   parentLinks: many(studentParents),
   enrollments: many(enrollments),
@@ -1157,3 +1257,7 @@ export type Correction = typeof corrections.$inferSelect;
 export type NewCorrection = typeof corrections.$inferInsert;
 export type CorrectionStatus = (typeof correctionStatusEnum.enumValues)[number];
 export type CorrectionMode = (typeof correctionModeEnum.enumValues)[number];
+export type AuditLogEntry = typeof auditLog.$inferSelect;
+export type NewAuditLogEntry = typeof auditLog.$inferInsert;
+export type StudentLoginAttempt = typeof studentLoginAttempts.$inferSelect;
+export type Role = (typeof roleEnum.enumValues)[number];

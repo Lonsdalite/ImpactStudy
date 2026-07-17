@@ -5,6 +5,7 @@ import { db, schema } from "@/lib/db";
 import { generateWeeklyReport } from "@/lib/llm/generate-report";
 import { FATIMA_VOICE } from "@/lib/llm/voice";
 import { reportWindow, weeklyStats, type ReportLesson } from "@/lib/reports";
+import { diligence, type DiligenceAssignment } from "@/lib/diligence";
 import { todaySydney } from "@/lib/billing";
 import type { VoiceSignature } from "@/lib/voice-types";
 
@@ -76,6 +77,27 @@ export async function draftWeeklyReportsForTenant(
     byStudent.set(l.studentId, arr);
   }
 
+  // Homework set to these students — the EFFORT signal (Slice D — doc 26 §2D).
+  // Whole history rather than a windowed query: diligence() slices the window
+  // itself, from ONE definition shared with the parent view and the portal, so
+  // the number in the note is the same number everyone else is looking at.
+  // Note what is NOT fetched: corrections. Scores are not part of this — the
+  // parent note can't leak a mark it was never handed.
+  const assignmentRows = await db
+    .select({
+      studentId: schema.assignments.studentId,
+      createdAt: schema.assignments.createdAt,
+      status: schema.assignments.status,
+    })
+    .from(schema.assignments)
+    .where(inArray(schema.assignments.studentId, ids));
+  const assignmentsByStudent = new Map<string, DiligenceAssignment[]>();
+  for (const a of assignmentRows) {
+    const arr = assignmentsByStudent.get(a.studentId) ?? [];
+    arr.push({ createdAt: a.createdAt.toISOString(), status: a.status });
+    assignmentsByStudent.set(a.studentId, arr);
+  }
+
   // Existing notes for this exact period, so we don't duplicate or clobber.
   const existingRows = await db
     .select({
@@ -106,8 +128,12 @@ export async function draftWeeklyReportsForTenant(
     }
 
     const stats = weeklyStats(byStudent.get(s.id) ?? [], today);
+    const effort = diligence(assignmentsByStudent.get(s.id) ?? [], today);
+    // Homework set this week counts as activity in its own right: a child who
+    // did their worksheets during a week with no lesson still deserves a note.
     const hasActivity =
-      stats.present + stats.late + stats.absent + stats.cancelled > 0;
+      stats.present + stats.late + stats.absent + stats.cancelled > 0 ||
+      effort.set > 0;
     if (!hasActivity) {
       // Nothing happened this week — no empty note, no wasted API call.
       skipped++;
@@ -119,6 +145,7 @@ export async function draftWeeklyReportsForTenant(
       studentName: s.firstName,
       yearLevel: s.yearLevel ?? undefined,
       stats,
+      diligence: effort,
     });
 
     if (prior) {

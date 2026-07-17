@@ -1,8 +1,7 @@
 import { redirect } from "next/navigation";
-import { createClient } from "@/lib/supabase/server";
 import { resolveActiveTenant } from "@/lib/tenant";
+import { getTenantVoice } from "@/lib/voice.server";
 import { VoiceCapture } from "@/components/dashboard/voice-capture";
-import type { VoiceSignature } from "@/lib/voice-types";
 
 export const metadata = { title: "Voice" };
 
@@ -29,15 +28,10 @@ export default async function VoicePage() {
     );
   }
 
-  const supabase = await createClient();
-  const { data } = await supabase
-    .from("tenants")
-    .select("voice_signature")
-    .eq("id", tenant.tenantId)
-    .single();
-  const voice =
-    (data as unknown as { voice_signature: VoiceSignature | null } | null)
-      ?.voice_signature ?? null;
+  // Drizzle, not the supabase-js path: `authenticated` has no column privilege
+  // on tenants.voice_signature (policies.sql §3 — it would otherwise be readable
+  // by students and parents). See lib/voice.server.ts.
+  const voice = await getTenantVoice(tenant.tenantId);
 
   return (
     <main className="flex-1 px-6 py-10 md:px-10">

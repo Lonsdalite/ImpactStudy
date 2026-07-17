@@ -12,8 +12,9 @@ import {
   weeklyStats,
   type ReportLesson,
 } from "@/lib/reports";
+import { diligence, diligenceLine, type Diligence } from "@/lib/diligence";
 import { shortDate, todaySydney } from "@/lib/billing";
-import type { LessonStatus, ReportStatus } from "@/lib/db/schema";
+import type { AssignmentStatus, LessonStatus, ReportStatus } from "@/lib/db/schema";
 
 export const metadata = { title: "Reports" };
 
@@ -28,6 +29,11 @@ interface LessonRow {
   status: LessonStatus;
   note?: string | null; // absent on the parent_lessons view (internal column)
 }
+interface AssignmentRow {
+  student_id: string;
+  created_at: string;
+  status: AssignmentStatus;
+}
 interface ReportRow {
   id: string;
   student_id: string;
@@ -39,6 +45,15 @@ interface ReportRow {
   period_start: string;
   period_end: string;
   student: { first_name: string; last_name: string | null } | null;
+}
+
+/** The deterministic win card, shared by both lenses (staff + parent). */
+interface WinCard {
+  id: string;
+  name: string;
+  firstName: string;
+  stats: ReturnType<typeof weeklyStats>;
+  diligence: Diligence | null;
 }
 
 function fullName(first: string, last: string | null) {
@@ -89,11 +104,39 @@ export default async function ReportsPage() {
     }
   }
 
+  // Homework EFFORT per student (Slice D — doc 26 §2D). Both staff and parents
+  // read `assignments` for their own scope (RLS: staff tenant-wide, a parent
+  // their own children), so ONE query serves both lenses. Deliberately no
+  // corrections query: this signal is what came back, never what it scored —
+  // a parent must not be shown a grade, and the way to guarantee that is not to
+  // fetch one.
+  const diligenceByStudent = new Map<string, Diligence>();
+  if (students.length > 0) {
+    const ids = students.map((s) => s.id);
+    const { data: assignmentData } = await supabase
+      .from("assignments")
+      .select("student_id, created_at, status")
+      .in("student_id", ids);
+    const rows = (assignmentData ?? []) as unknown as AssignmentRow[];
+    for (const id of ids) {
+      diligenceByStudent.set(
+        id,
+        diligence(
+          rows
+            .filter((a) => a.student_id === id)
+            .map((a) => ({ createdAt: a.created_at, status: a.status })),
+          today,
+        ),
+      );
+    }
+  }
+
   const cards = students.map((s) => ({
     id: s.id,
     name: fullName(s.first_name, s.last_name),
     firstName: s.first_name,
     stats: weeklyStats(lessonsByStudent.get(s.id) ?? [], today),
+    diligence: diligenceByStudent.get(s.id) ?? null,
   }));
 
   return (
@@ -146,12 +189,7 @@ async function StaffView({
   tenantId: string;
   periodStart: string;
   periodLabel: string;
-  cards: {
-    id: string;
-    name: string;
-    firstName: string;
-    stats: ReturnType<typeof weeklyStats>;
-  }[];
+  cards: WinCard[];
 }) {
   const supabase = await createClient();
   const { data } = await supabase
@@ -199,6 +237,11 @@ async function StaffView({
                 <p className="mt-1 text-sm text-brand-ink/70">
                   {microWin(c.stats, c.firstName)}
                 </p>
+                {c.diligence ? (
+                  <p className="mt-0.5 text-sm text-brand-ink/60">
+                    {diligenceLine(c.diligence, c.firstName)}
+                  </p>
+                ) : null}
                 {c.stats.notes[0] ? (
                   <p className="mt-1 text-xs italic text-brand-ink/50">
                     {shortDate(c.stats.notes[0].date)}: {c.stats.notes[0].note}
@@ -218,12 +261,7 @@ async function ParentView({
   cards,
 }: {
   childIds: string[];
-  cards: {
-    id: string;
-    name: string;
-    firstName: string;
-    stats: ReturnType<typeof weeklyStats>;
-  }[];
+  cards: WinCard[];
 }) {
   const supabase = await createClient();
   // A parent only ever sees a note the tutor has SENT — never a draft, and not
@@ -261,6 +299,14 @@ async function ParentView({
             <p className="mt-2 text-sm text-brand-ink/75">
               {microWin(c.stats, c.firstName)}
             </p>
+            {/* Effort, never score (doc 26 §2D). "Completed 4 of 5 worksheets"
+                is deterministic and actionable; the marks behind them stay
+                between Fatima and the student — the warmth thesis. */}
+            {c.diligence ? (
+              <p className="mt-1 text-sm text-brand-ink/70">
+                {diligenceLine(c.diligence, c.firstName)}
+              </p>
+            ) : null}
 
             {note ? (
               <div className="mt-4 rounded-xl border border-brand-mist bg-brand-cream/40 p-4">
