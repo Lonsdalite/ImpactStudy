@@ -59,8 +59,8 @@ export function WorksheetLibrary({
   const archived = worksheets.filter((w) => !w.active);
 
   // Instant filter over the active library — title, topic, or subject. The list
-  // grows without bound (every ingested PDF), so search earns its place here
-  // once there's more than a handful.
+  // grows without bound (every ingested PDF), so search earns its place as soon
+  // as there's more than one worksheet to sift.
   const q = query.trim().toLowerCase();
   const visible = useMemo(
     () =>
@@ -195,7 +195,7 @@ export function WorksheetLibrary({
         <h2 className="text-sm font-medium text-brand-plum">
           Library ({active.length})
         </h2>
-        {active.length >= 5 ? (
+        {active.length >= 2 ? (
           <div className="mt-3">
             <SearchInput
               value={query}

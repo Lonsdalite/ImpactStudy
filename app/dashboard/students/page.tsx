@@ -97,10 +97,10 @@ export default async function StudentsPage({
     };
   });
 
-  // Show the instant filter only where it earns its place: staff (a parent has
-  // a couple of children) and a roster past a handful. Threshold kept low so it
-  // appears in the pilot; a brand-new practice with ≤4 doesn't get the chrome.
-  const showSearch = isStaff && rows.length >= 5;
+  // Show the instant filter for staff (a parent has a couple of children) as
+  // soon as there's more than one student to filter. A single slim field is not
+  // "busy"; keeping the floor at 2 just avoids a pointless search over one row.
+  const showSearch = isStaff && rows.length >= 2;
 
   return (
     <main className="flex-1 px-6 py-10 md:px-10">
