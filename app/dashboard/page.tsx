@@ -58,15 +58,18 @@ export default async function DashboardPage() {
             : "Your practice at a glance."}
         </p>
 
-        <div className="mt-10 grid gap-5 sm:grid-cols-3">
+        {/* Mobile density: two tiles per row (the third spans full width) with
+            tighter padding and a right-sized number — so the fold shows more
+            than one stat. Desktop stays 3-across. Content is unchanged. */}
+        <div className="mt-8 grid grid-cols-2 gap-3 sm:grid-cols-3 sm:gap-4">
           <Link
             href="/dashboard/students"
-            className="flex flex-col rounded-2xl border border-brand-mist bg-white p-6 transition-colors hover:border-brand-plum/30"
+            className="flex flex-col rounded-2xl border border-brand-mist bg-white p-4 transition-colors hover:border-brand-plum/30 sm:p-5"
           >
             <span className="text-sm font-medium text-brand-plum">
               {isParent ? "Children" : "Students"}
             </span>
-            <span className="mt-3 font-display text-4xl text-brand-plum">
+            <span className="mt-2 font-display text-2xl text-brand-plum sm:text-3xl">
               {studentCount}
             </span>
             <span className="mt-1 text-xs text-brand-ink/55">
@@ -75,11 +78,11 @@ export default async function DashboardPage() {
           </Link>
 
           {isParent ? (
-            <div className="flex flex-col rounded-2xl border border-brand-mist bg-white p-6">
+            <div className="flex flex-col rounded-2xl border border-brand-mist bg-white p-4 sm:p-5">
               <span className="text-sm font-medium text-brand-plum">
                 Practice
               </span>
-              <span className="mt-3 font-display text-4xl text-brand-ink/25">
+              <span className="mt-2 font-display text-2xl text-brand-ink/25 sm:text-3xl">
                 —
               </span>
               <span className="mt-1 text-xs text-brand-ink/55">
@@ -89,12 +92,12 @@ export default async function DashboardPage() {
           ) : (
             <Link
               href="/dashboard/billing"
-              className="flex flex-col rounded-2xl border border-brand-mist bg-white p-6 transition-colors hover:border-brand-plum/30"
+              className="flex flex-col rounded-2xl border border-brand-mist bg-white p-4 transition-colors hover:border-brand-plum/30 sm:p-5"
             >
               <span className="text-sm font-medium text-brand-plum">
                 Billed this month
               </span>
-              <span className="mt-3 font-display text-4xl text-brand-plum">
+              <span className="mt-2 font-display text-2xl text-brand-plum sm:text-3xl">
                 {formatMoney(monthBilledCents)}
               </span>
               <span className="mt-1 text-xs text-brand-ink/55">
@@ -105,10 +108,10 @@ export default async function DashboardPage() {
 
           <Link
             href="/dashboard/reports"
-            className="flex flex-col rounded-2xl border border-brand-mist bg-white p-6 transition-colors hover:border-brand-plum/30"
+            className="col-span-2 flex flex-col rounded-2xl border border-brand-mist bg-white p-4 transition-colors hover:border-brand-plum/30 sm:col-span-1 sm:p-5"
           >
             <span className="text-sm font-medium text-brand-plum">Reports</span>
-            <span className="mt-3 font-display text-4xl text-brand-plum">
+            <span className="mt-2 font-display text-2xl text-brand-plum sm:text-3xl">
               {isParent ? "Progress" : "Heartbeat"}
             </span>
             <span className="mt-1 text-xs text-brand-ink/55">
