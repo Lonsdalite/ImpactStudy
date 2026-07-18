@@ -3,6 +3,7 @@
 import Image from "next/image";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { AccountMenu } from "@/components/dashboard/account-menu";
 
 const NAV: {
   href: string;
@@ -74,7 +75,7 @@ export function DashboardChrome({
             height={38}
             className="select-none"
           />
-          <div className="min-w-0">
+          <div className="min-w-0 flex-1">
             <span className="block font-display text-lg leading-tight text-brand-plum">
               {BRAND}
             </span>
@@ -83,6 +84,9 @@ export function DashboardChrome({
               {tenantName && tenantName !== BRAND ? ` · ${tenantName}` : ""}
             </span>
           </div>
+          {/* Account control lives at the TOP of the sidebar so it never falls
+              below the fold on a short window. */}
+          <AccountMenu userEmail={userEmail} canSwitch={canSwitch} />
         </div>
 
         <nav className="mt-2 flex flex-1 flex-col gap-0.5 px-3">
@@ -104,28 +108,6 @@ export function DashboardChrome({
             );
           })}
         </nav>
-
-        <div className="border-t border-brand-mist px-5 py-4">
-          <p className="truncate text-xs text-brand-ink/55">{userEmail}</p>
-          <div className="mt-2 flex items-center gap-3 text-xs">
-            {canSwitch ? (
-              <Link
-                href="/tenant-select"
-                className="text-brand-plum-mid hover:underline"
-              >
-                Switch
-              </Link>
-            ) : null}
-            <form action="/auth/sign-out" method="post">
-              <button
-                type="submit"
-                className="text-brand-plum-mid underline-offset-4 hover:underline"
-              >
-                Sign out
-              </button>
-            </form>
-          </div>
-        </div>
       </aside>
 
       {/* Mobile top bar */}
@@ -143,14 +125,7 @@ export function DashboardChrome({
               {tenantName && tenantName !== BRAND ? tenantName : BRAND}
             </span>
           </div>
-          <form action="/auth/sign-out" method="post">
-            <button
-              type="submit"
-              className="text-xs text-brand-plum-mid underline-offset-4 hover:underline"
-            >
-              Sign out
-            </button>
-          </form>
+          <AccountMenu userEmail={userEmail} canSwitch={canSwitch} />
         </div>
         {/* Horizontal pill bar. It scrolls WITHIN itself (a contained strip) —
             the page body never scrolls sideways. Tap targets are ≥44px tall

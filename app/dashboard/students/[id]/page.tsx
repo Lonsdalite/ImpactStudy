@@ -16,6 +16,10 @@ import { UndoPaymentButton } from "@/components/dashboard/undo-payment-button";
 import { StudentAdmin } from "@/components/dashboard/student-admin";
 import { StudentPortalAccount } from "@/components/dashboard/student-portal-account";
 import {
+  StudentRecordTabs,
+  type RecordTab,
+} from "@/components/dashboard/student-record-tabs";
+import {
   EnrollmentsManager,
   type EnrollmentRow,
   type SubjectOption,
@@ -130,8 +134,10 @@ function prettyDate(iso: string): string {
 
 export default async function StudentDetailPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ id: string }>;
+  searchParams: Promise<{ tab?: string }>;
 }) {
   const result = await resolveActiveTenant();
   if (result.status !== "ok") {
@@ -139,6 +145,7 @@ export default async function StudentDetailPage({
   }
   const isStaff = ["owner", "admin", "tutor"].includes(result.tenant.role);
   const { id } = await params;
+  const { tab: initialTab } = await searchParams;
 
   const supabase = await createClient();
   const { data: studentData } = await supabase
@@ -303,6 +310,190 @@ export default async function StudentDetailPage({
       .sort((a, b) => a.weekday - b.weekday || a.startTime.localeCompare(b.startTime)),
   }));
 
+  // ── Tabbed record ────────────────────────────────────────────────────────
+  // The header/summary above stays always-visible; everything else is grouped
+  // into one-concern-per-tab panels. Content is rendered here (server side) and
+  // handed to the client tab shell as `content` — no extra fetching, and every
+  // action inside a panel keeps working. Staff-only sections simply don't add
+  // their tab for a parent, so a parent sees just Overview + Billing.
+
+  const overviewPanel = (
+    <div className="mt-8">
+      <h2 className="text-sm font-medium text-brand-plum">Billed by subject</h2>
+      {rollupRows.length === 0 ? (
+        <p className="mt-3 text-sm text-brand-ink/60">
+          Nothing billed yet. Attended lessons roll up here by subject.
+        </p>
+      ) : (
+        <div className="mt-3 overflow-hidden rounded-2xl border border-brand-mist bg-white">
+          <ul className="divide-y divide-brand-mist">
+            {rollupRows.map(([subject, v]) => (
+              <li
+                key={subject}
+                className="flex items-center justify-between px-5 py-3 text-sm"
+              >
+                <span className="text-brand-ink/75">{subject}</span>
+                <span className="flex items-center gap-4">
+                  <span className="text-xs text-brand-ink/55">
+                    {formatDuration(v.minutes)}
+                  </span>
+                  <span className="w-16 text-right font-medium text-brand-plum">
+                    {formatMoney(v.cents)}
+                  </span>
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+
+  const attendanceSection = (
+    <div className="mt-8">
+      <h2 className="text-sm font-medium text-brand-plum">Attendance history</h2>
+      {lessons.length === 0 ? (
+        <p className="mt-3 text-sm text-brand-ink/60">No lessons recorded yet.</p>
+      ) : (
+        <div className="mt-3 overflow-hidden rounded-2xl border border-brand-mist bg-white">
+          <ul className="divide-y divide-brand-mist">
+            {lessons.map((l, i) => (
+              <li
+                key={`${l.date}-${i}`}
+                className="flex items-center justify-between px-5 py-3 text-sm"
+              >
+                <span className="text-brand-ink/75">
+                  {prettyDate(l.date)}
+                  <span className="ml-2 text-xs text-brand-ink/45">
+                    {l.subjectName ?? "—"} · {formatDuration(l.duration_minutes)}
+                  </span>
+                </span>
+                <span className="flex items-center gap-4">
+                  <span
+                    className={
+                      l.status === "attended" || l.status === "late"
+                        ? "text-brand-plum"
+                        : "text-brand-ink/45"
+                    }
+                  >
+                    {STATUS_LABEL[l.status]}
+                  </span>
+                  <span className="w-16 text-right font-medium text-brand-plum">
+                    {formatMoney(l.amount_cents)}
+                  </span>
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+
+  const paymentsSection = (
+    <div className="mt-8">
+      <h2 className="text-sm font-medium text-brand-plum">Payments</h2>
+      {payments.length === 0 ? (
+        <p className="mt-3 text-sm text-brand-ink/60">
+          No payments recorded yet. Log them from the Billing page.
+        </p>
+      ) : (
+        <div className="mt-3 overflow-hidden rounded-2xl border border-brand-mist bg-white">
+          <ul className="divide-y divide-brand-mist">
+            {payments.map((p) => (
+              <li
+                key={p.id}
+                className="flex items-center justify-between px-5 py-3 text-sm"
+              >
+                <span className="text-brand-ink/75">{prettyDate(p.paid_on)}</span>
+                <span className="flex items-center gap-4">
+                  <span className="rounded-full bg-brand-sage/15 px-3 py-1 text-xs font-medium text-brand-plum">
+                    {METHOD_LABEL[p.method]}
+                  </span>
+                  <span className="w-16 text-right font-medium text-brand-sage">
+                    {formatMoney(p.amount_cents)}
+                  </span>
+                  {isStaff ? <UndoPaymentButton paymentId={p.id} /> : null}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+
+  const tabs: RecordTab[] = [{ id: "overview", label: "Overview", content: overviewPanel }];
+
+  if (isStaff) {
+    tabs.push({
+      id: "homework",
+      label: "Homework",
+      content: (
+        <AssignmentTracker
+          studentId={student.id}
+          worksheets={trackerWorksheets}
+          assignments={trackerAssignments}
+        />
+      ),
+    });
+    tabs.push({
+      id: "schedule",
+      label: "Schedule",
+      content: (
+        <EnrollmentsManager
+          studentId={student.id}
+          subjects={subjects}
+          enrollments={enrollments}
+          hasYearLevel={!!student.year_level}
+        />
+      ),
+    });
+  }
+
+  tabs.push({
+    id: "billing",
+    label: "Billing",
+    content: (
+      <>
+        {isStaff ? (
+          <BillingSettingsForm
+            studentId={student.id}
+            defaultYearLevel={student.year_level ?? ""}
+            defaultCycle={student.billing_cycle}
+            defaultAnchor={anchor}
+          />
+        ) : null}
+        {attendanceSection}
+        {paymentsSection}
+      </>
+    ),
+  });
+
+  if (isStaff) {
+    tabs.push({
+      id: "account",
+      label: "Account",
+      content: (
+        <>
+          {/* Portal login sits with the account-level controls (archive/delete):
+              it's about the student's ACCESS, not their work. */}
+          <StudentPortalAccount
+            studentId={student.id}
+            studentName={fullName}
+            firstName={student.first_name}
+            username={student.username}
+          />
+          <StudentAdmin
+            studentId={student.id}
+            studentName={fullName}
+            active={student.active}
+          />
+        </>
+      ),
+    });
+  }
+
   return (
     <main className="flex-1 px-6 py-10 md:px-10">
       <div className="mx-auto max-w-4xl">
@@ -359,156 +550,7 @@ export default async function StudentDetailPage({
           </p>
         ) : null}
 
-        {/* Billing settings — staff only */}
-        {isStaff ? (
-          <BillingSettingsForm
-            studentId={student.id}
-            defaultYearLevel={student.year_level ?? ""}
-            defaultCycle={student.billing_cycle}
-            defaultAnchor={anchor}
-          />
-        ) : null}
-
-        {/* Enrollments — staff only */}
-        {isStaff ? (
-          <EnrollmentsManager
-            studentId={student.id}
-            subjects={subjects}
-            enrollments={enrollments}
-            hasYearLevel={!!student.year_level}
-          />
-        ) : null}
-
-        {/* Homework pipeline — staff only */}
-        {isStaff ? (
-          <AssignmentTracker
-            studentId={student.id}
-            worksheets={trackerWorksheets}
-            assignments={trackerAssignments}
-          />
-        ) : null}
-
-        {/* Subjects → hours → total rollup */}
-        {rollupRows.length > 0 ? (
-          <div className="mt-8">
-            <h2 className="text-sm font-medium text-brand-plum">
-              Billed by subject
-            </h2>
-            <div className="mt-3 overflow-hidden rounded-2xl border border-brand-mist bg-white">
-              <ul className="divide-y divide-brand-mist">
-                {rollupRows.map(([subject, v]) => (
-                  <li
-                    key={subject}
-                    className="flex items-center justify-between px-5 py-3 text-sm"
-                  >
-                    <span className="text-brand-ink/75">{subject}</span>
-                    <span className="flex items-center gap-4">
-                      <span className="text-xs text-brand-ink/55">
-                        {formatDuration(v.minutes)}
-                      </span>
-                      <span className="w-16 text-right font-medium text-brand-plum">
-                        {formatMoney(v.cents)}
-                      </span>
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          </div>
-        ) : null}
-
-        <h2 className="mt-10 text-sm font-medium text-brand-plum">
-          Attendance history
-        </h2>
-        {lessons.length === 0 ? (
-          <p className="mt-3 text-sm text-brand-ink/60">
-            No lessons recorded yet.
-          </p>
-        ) : (
-          <div className="mt-3 overflow-hidden rounded-2xl border border-brand-mist bg-white">
-            <ul className="divide-y divide-brand-mist">
-              {lessons.map((l, i) => (
-                <li
-                  key={`${l.date}-${i}`}
-                  className="flex items-center justify-between px-5 py-3 text-sm"
-                >
-                  <span className="text-brand-ink/75">
-                    {prettyDate(l.date)}
-                    <span className="ml-2 text-xs text-brand-ink/45">
-                      {l.subjectName ?? "—"} ·{" "}
-                      {formatDuration(l.duration_minutes)}
-                    </span>
-                  </span>
-                  <span className="flex items-center gap-4">
-                    <span
-                      className={
-                        l.status === "attended" || l.status === "late"
-                          ? "text-brand-plum"
-                          : "text-brand-ink/45"
-                      }
-                    >
-                      {STATUS_LABEL[l.status]}
-                    </span>
-                    <span className="w-16 text-right font-medium text-brand-plum">
-                      {formatMoney(l.amount_cents)}
-                    </span>
-                  </span>
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
-
-        <h2 className="mt-10 text-sm font-medium text-brand-plum">Payments</h2>
-        {payments.length === 0 ? (
-          <p className="mt-3 text-sm text-brand-ink/60">
-            No payments recorded yet. Log them from the Billing page.
-          </p>
-        ) : (
-          <div className="mt-3 overflow-hidden rounded-2xl border border-brand-mist bg-white">
-            <ul className="divide-y divide-brand-mist">
-              {payments.map((p) => (
-                <li
-                  key={p.id}
-                  className="flex items-center justify-between px-5 py-3 text-sm"
-                >
-                  <span className="text-brand-ink/75">
-                    {prettyDate(p.paid_on)}
-                  </span>
-                  <span className="flex items-center gap-4">
-                    <span className="rounded-full bg-brand-sage/15 px-3 py-1 text-xs font-medium text-brand-plum">
-                      {METHOD_LABEL[p.method]}
-                    </span>
-                    <span className="w-16 text-right font-medium text-brand-sage">
-                      {formatMoney(p.amount_cents)}
-                    </span>
-                    {isStaff ? <UndoPaymentButton paymentId={p.id} /> : null}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
-
-        {/* Portal login — staff only. Sits next to the other account-level
-            controls (archive/delete) rather than up with the homework: it's
-            about the student's ACCESS, not their work. */}
-        {isStaff ? (
-          <StudentPortalAccount
-            studentId={student.id}
-            studentName={fullName}
-            firstName={student.first_name}
-            username={student.username}
-          />
-        ) : null}
-
-        {isStaff ? (
-          <StudentAdmin
-            studentId={student.id}
-            studentName={fullName}
-            active={student.active}
-          />
-        ) : null}
+        <StudentRecordTabs tabs={tabs} initialTab={initialTab} />
       </div>
     </main>
   );
