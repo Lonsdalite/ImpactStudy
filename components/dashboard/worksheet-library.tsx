@@ -1,8 +1,9 @@
 "use client";
 
-import { useRef, useState, useTransition } from "react";
+import { useMemo, useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
+import { SearchInput } from "@/components/dashboard/search-input";
 import { createClient } from "@/lib/supabase/client";
 import {
   createAssignment,
@@ -52,9 +53,26 @@ export function WorksheetLibrary({
   const [topic, setTopic] = useState("");
   const [file, setFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
+  const [query, setQuery] = useState("");
 
   const active = worksheets.filter((w) => w.active);
   const archived = worksheets.filter((w) => !w.active);
+
+  // Instant filter over the active library — title, topic, or subject. The list
+  // grows without bound (every ingested PDF), so search earns its place here
+  // once there's more than a handful.
+  const q = query.trim().toLowerCase();
+  const visible = useMemo(
+    () =>
+      q
+        ? active.filter((w) =>
+            [w.title, w.topic, w.subjectName]
+              .filter(Boolean)
+              .some((t) => (t as string).toLowerCase().includes(q)),
+          )
+        : active,
+    [active, q],
+  );
 
   async function upload() {
     if (!title.trim()) {
@@ -177,13 +195,27 @@ export function WorksheetLibrary({
         <h2 className="text-sm font-medium text-brand-plum">
           Library ({active.length})
         </h2>
+        {active.length >= 5 ? (
+          <div className="mt-3">
+            <SearchInput
+              value={query}
+              onChange={setQuery}
+              placeholder="Search worksheets"
+              label="Search worksheets by title, topic, or subject"
+            />
+          </div>
+        ) : null}
         {active.length === 0 ? (
           <p className="mt-3 text-sm text-brand-ink/55">
             Nothing yet — add your first worksheet above.
           </p>
+        ) : visible.length === 0 ? (
+          <p className="mt-3 text-sm text-brand-ink/55">
+            No worksheets match &ldquo;{query.trim()}&rdquo;.
+          </p>
         ) : (
           <ul className="mt-3 flex flex-col gap-3">
-            {active.map((w) => (
+            {visible.map((w) => (
               <WorksheetCard key={w.id} worksheet={w} students={students} />
             ))}
           </ul>
