@@ -4,6 +4,10 @@ import { createClient } from "@/lib/supabase/server";
 import { resolveActiveTenant } from "@/lib/tenant";
 import { EmptyState } from "@/components/dashboard/empty-state";
 import { AddStudentForm } from "@/components/dashboard/add-student-form";
+import {
+  StudentList,
+  type StudentListRow,
+} from "@/components/dashboard/student-list";
 import { formatMoney, nextCollection, shortDate, todaySydney } from "@/lib/billing";
 import type { BillingCycle } from "@/lib/db/schema";
 
@@ -74,6 +78,30 @@ export default async function StudentsPage({
     }
   }
 
+  // Pre-format each row on the server (balance strings use the billing utils)
+  // so the client list stays a dumb, filterable presenter.
+  const rows: StudentListRow[] = students.map((s) => {
+    const bal = balance.get(s.id);
+    const balanceLabel =
+      isParent && bal
+        ? bal.outstanding > 0
+          ? `${formatMoney(bal.outstanding)} · due ${shortDate(bal.due)}`
+          : "Settled"
+        : null;
+    return {
+      id: s.id,
+      name: `${s.first_name}${s.last_name ? ` ${s.last_name}` : ""}`,
+      yearLevel: s.year_level ?? "—",
+      balanceLabel,
+      settled: isParent && bal ? bal.outstanding <= 0 : false,
+    };
+  });
+
+  // Show the instant filter only where it earns its place: staff (a parent has
+  // a couple of children) and a roster past a handful. Threshold kept low so it
+  // appears in the pilot; a brand-new practice with ≤4 doesn't get the chrome.
+  const showSearch = isStaff && rows.length >= 5;
+
   return (
     <main className="flex-1 px-6 py-10 md:px-10">
       <div className="mx-auto max-w-4xl">
@@ -114,41 +142,7 @@ export default async function StudentsPage({
             />
           </div>
         ) : (
-          <div className="mt-8 overflow-hidden rounded-2xl border border-brand-mist bg-white">
-            <ul className="divide-y divide-brand-mist">
-              {students.map((s) => {
-                const bal = balance.get(s.id);
-                return (
-                  <li key={s.id}>
-                    <Link
-                      href={`/dashboard/students/${s.id}`}
-                      className="flex items-center justify-between px-5 py-4 transition-colors hover:bg-brand-plum/[0.03]"
-                    >
-                      <span className="font-medium text-brand-plum">
-                        {s.first_name}
-                        {s.last_name ? ` ${s.last_name}` : ""}
-                      </span>
-                      <span className="flex items-center gap-4">
-                        {isParent && bal ? (
-                          bal.outstanding > 0 ? (
-                            <span className="text-xs text-brand-ink/60">
-                              {formatMoney(bal.outstanding)} · due{" "}
-                              {shortDate(bal.due)}
-                            </span>
-                          ) : (
-                            <span className="text-xs text-brand-sage">Settled</span>
-                          )
-                        ) : null}
-                        <span className="rounded-full bg-brand-sage/15 px-3 py-1 text-xs font-medium text-brand-plum">
-                          {s.year_level ?? "—"}
-                        </span>
-                      </span>
-                    </Link>
-                  </li>
-                );
-              })}
-            </ul>
-          </div>
+          <StudentList rows={rows} showSearch={showSearch} />
         )}
 
         {isStaff ? (
