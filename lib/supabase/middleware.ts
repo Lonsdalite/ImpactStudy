@@ -60,8 +60,12 @@ export async function updateSession(request: NextRequest) {
     data: { user },
   } = await supabase.auth.getUser();
   if (process.env.PERF_LOG !== "0") {
+    // Region matters here specifically: `regions` in vercel.json pins SERVERLESS
+    // functions, and this proxy runs at the edge PoP nearest the caller — so
+    // unlike every other timing in the app, this one is a function of where the
+    // USER is, not where we deployed to (doc 42).
     console.log(
-      `[perf] middleware.getUser ${(performance.now() - tUser).toFixed(0)}ms path=${request.nextUrl.pathname}`,
+      `[perf] middleware.getUser ${(performance.now() - tUser).toFixed(0)}ms path=${request.nextUrl.pathname} region=${process.env.VERCEL_REGION ?? "?"}`,
     );
   }
 

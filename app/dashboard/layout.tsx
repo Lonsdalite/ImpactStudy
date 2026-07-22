@@ -1,6 +1,5 @@
 import { redirect } from "next/navigation";
-import { createClient } from "@/lib/supabase/server";
-import { resolveActiveTenant } from "@/lib/tenant";
+import { getSessionUser, resolveActiveTenant } from "@/lib/tenant";
 import { nowMs, perfLog } from "@/lib/perf";
 import { DashboardChrome } from "@/components/dashboard/dashboard-chrome";
 
@@ -10,11 +9,10 @@ export default async function DashboardLayout({
   children: React.ReactNode;
 }) {
   const tLayout = nowMs();
-  const supabase = await createClient();
+  // Same validated getUser() as before, via the request-scoped helper — so the
+  // layout and getMemberships() share one call instead of making two (doc 42).
   const tUser = nowMs();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const user = await getSessionUser();
   perfLog("layout.getUser", tUser);
   if (!user) redirect("/login");
 
