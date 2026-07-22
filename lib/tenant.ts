@@ -1,4 +1,5 @@
 import "server-only";
+import { cache } from "react";
 import { cookies } from "next/headers";
 import { createClient } from "@/lib/supabase/server";
 import { perfLog } from "@/lib/perf";
@@ -10,6 +11,16 @@ import { perfLog } from "@/lib/perf";
  * NOT Drizzle — so this is the path that actually exercises the Day 3 policies.
  * A user sees only memberships where user_id = auth.uid(); a parent sees only
  * their own children downstream.
+ *
+ * Every export here is wrapped in React `cache()` (doc 42). The dashboard layout
+ * resolves the tenant and then each PAGE resolved it again, so a single
+ * navigation ran the memberships query twice — measured at 2 × ~650ms from the
+ * old US-East region, and still two needless round trips after the move to
+ * syd1. `cache()` is REQUEST-scoped, not a shared cache: two users, or the same
+ * user on two requests, never see each other's result, so this changes cost
+ * without touching the tenant-isolation boundary. Nothing here is memoised
+ * across requests, and the middleware's own getUser() — the one that actually
+ * gates protected routes — is a separate runtime and stays a real validation.
  */
 
 export const ACTIVE_TENANT_COOKIE = "is_active_tenant";
@@ -33,14 +44,29 @@ interface MembershipRow {
   } | null;
 }
 
-export async function getMemberships(): Promise<TenantMembership[]> {
+/**
+ * The signed-in user, validated once per request.
+ *
+ * Still a real `getUser()` — the server-side validation, never `getSession()` —
+ * just not repeated by every caller that needs the same answer within one
+ * render. The dashboard layout and `getMemberships()` both want it.
+ */
+export const getSessionUser = cache(async function getSessionUser() {
   const supabase = await createClient();
   const tUser = performance.now();
   const {
     data: { user },
   } = await supabase.auth.getUser();
   perfLog("tenant.getUser", tUser);
+  return user;
+});
+
+export const getMemberships = cache(async function getMemberships(): Promise<
+  TenantMembership[]
+> {
+  const user = await getSessionUser();
   if (!user) return [];
+  const supabase = await createClient();
   const tRows = performance.now();
 
   // Filter to the CURRENT user's own memberships. Required because the
@@ -66,7 +92,7 @@ export async function getMemberships(): Promise<TenantMembership[]> {
       brandColor: r.tenant.brand_color,
       role: r.role,
     }));
-}
+});
 
 export type ActiveTenantResult =
   | { status: "ok"; tenant: TenantMembership; memberships: TenantMembership[] }
@@ -80,7 +106,7 @@ export type ActiveTenantResult =
  * - more than one → caller should send them to /tenant-select
  * - none          → user belongs to no tenant
  */
-export async function resolveActiveTenant(): Promise<ActiveTenantResult> {
+export const resolveActiveTenant = cache(async function resolveActiveTenant(): Promise<ActiveTenantResult> {
   const t0 = performance.now();
   const memberships = await getMemberships();
   perfLog("tenant.resolve", t0);
@@ -96,4 +122,4 @@ export async function resolveActiveTenant(): Promise<ActiveTenantResult> {
   if (memberships.length === 1)
     return { status: "ok", tenant: memberships[0], memberships };
   return { status: "select", memberships };
-}
+});
