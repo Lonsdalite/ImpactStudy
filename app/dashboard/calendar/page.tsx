@@ -2,6 +2,7 @@ import { redirect } from "next/navigation";
 import Link from "next/link";
 import { resolveActiveTenant } from "@/lib/tenant";
 import { loadCalendarWeek } from "@/lib/calendar-data";
+import { nowMs, perfLog } from "@/lib/perf";
 import {
   computeWeekOccurrences,
   dayLabel,
@@ -41,6 +42,7 @@ export default async function CalendarPage({
 }: {
   searchParams: Promise<{ week?: string; student?: string }>;
 }) {
+  const tPage = nowMs();
   const result = await resolveActiveTenant();
   if (result.status !== "ok") {
     redirect(result.status === "none" ? "/login" : "/tenant-select");
@@ -67,7 +69,10 @@ export default async function CalendarPage({
   const monday = weekStart(params.week ?? today);
   const dates = weekDates(monday);
 
+  const tQueries = nowMs();
   const data = await loadCalendarWeek(tenant.tenantId, dates);
+  perfLog("page.calendar.queries", tQueries);
+  perfLog("page.calendar.total", tPage);
   const now = sydneyNow();
   const occurrences = computeWeekOccurrences({ ...data, dates, now });
 

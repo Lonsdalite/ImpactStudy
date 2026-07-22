@@ -4,7 +4,7 @@ import { createClient } from "@/lib/supabase/server";
 import { resolveActiveTenant } from "@/lib/tenant";
 import { signedUrls, SUBMISSIONS_BUCKET } from "@/lib/storage";
 import { getTenantVoice } from "@/lib/voice.server";
-import { nowMs, sinceMs } from "@/lib/perf";
+import { nowMs, perfLog, sinceMs } from "@/lib/perf";
 import { CorrectionUploader } from "@/components/dashboard/correction-uploader";
 import {
   CorrectionReview,
@@ -65,6 +65,7 @@ function fullName(first: string, last: string | null) {
 }
 
 export default async function HomeworkPage() {
+  const tPage = nowMs();
   const result = await resolveActiveTenant();
   if (result.status !== "ok") {
     redirect(result.status === "none" ? "/login" : "/tenant-select");
@@ -198,6 +199,7 @@ export default async function HomeworkPage() {
   const tSign = nowMs();
   const signed = await signedUrls(SUBMISSIONS_BUCKET, allImagePaths);
   console.log(`[homework] sign(${allImagePaths.length})=${sinceMs(tSign)}ms`);
+  perfLog("page.homework.total", tPage);
   const urlByPath = new Map<string, string>();
   allImagePaths.forEach((p, i) => {
     const u = signed[i];

@@ -9,6 +9,7 @@ import {
   shortDate,
   todaySydney,
 } from "@/lib/billing";
+import { nowMs, perfLog } from "@/lib/perf";
 import { RecordPaymentForm } from "@/components/dashboard/record-payment-form";
 import type { BillingCycle, LessonStatus } from "@/lib/db/schema";
 
@@ -33,6 +34,7 @@ interface PaymentRow {
 }
 
 export default async function BillingPage() {
+  const tPage = nowMs();
   const result = await resolveActiveTenant();
   if (result.status !== "ok") {
     redirect(result.status === "none" ? "/login" : "/tenant-select");
@@ -56,6 +58,7 @@ export default async function BillingPage() {
 
   const today = todaySydney();
   const supabase = await createClient();
+  const tQueries = nowMs();
   const [{ data: studentData }, { data: lessonData }, { data: payData }] =
     await Promise.all([
       supabase
@@ -74,6 +77,8 @@ export default async function BillingPage() {
         .select("student_id, amount_cents")
         .eq("tenant_id", tenant.tenantId),
     ]);
+  perfLog("page.billing.queries", tQueries);
+  perfLog("page.billing.total", tPage);
 
   const students = (studentData ?? []) as unknown as StudentRow[];
   const lessons = (lessonData ?? []) as unknown as LessonRow[];

@@ -1,6 +1,7 @@
 import "server-only";
 import { cookies } from "next/headers";
 import { createClient } from "@/lib/supabase/server";
+import { perfLog } from "@/lib/perf";
 
 /**
  * Active-tenant resolution.
@@ -34,10 +35,13 @@ interface MembershipRow {
 
 export async function getMemberships(): Promise<TenantMembership[]> {
   const supabase = await createClient();
+  const tUser = performance.now();
   const {
     data: { user },
   } = await supabase.auth.getUser();
+  perfLog("tenant.getUser", tUser);
   if (!user) return [];
+  const tRows = performance.now();
 
   // Filter to the CURRENT user's own memberships. Required because the
   // memberships RLS policy also lets staff (owner/admin/tutor) read every
@@ -48,6 +52,7 @@ export async function getMemberships(): Promise<TenantMembership[]> {
     .select("role, tenant:tenants(id, slug, display_name, brand_color)")
     .eq("user_id", user.id)
     .order("created_at", { ascending: true });
+  perfLog("tenant.memberships", tRows);
 
   if (error) throw error;
 
@@ -76,7 +81,9 @@ export type ActiveTenantResult =
  * - none          → user belongs to no tenant
  */
 export async function resolveActiveTenant(): Promise<ActiveTenantResult> {
+  const t0 = performance.now();
   const memberships = await getMemberships();
+  perfLog("tenant.resolve", t0);
   if (memberships.length === 0) return { status: "none" };
 
   const cookieStore = await cookies();
