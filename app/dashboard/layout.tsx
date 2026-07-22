@@ -1,6 +1,7 @@
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { resolveActiveTenant } from "@/lib/tenant";
+import { nowMs, perfLog } from "@/lib/perf";
 import { DashboardChrome } from "@/components/dashboard/dashboard-chrome";
 
 export default async function DashboardLayout({
@@ -8,13 +9,17 @@ export default async function DashboardLayout({
 }: {
   children: React.ReactNode;
 }) {
+  const tLayout = nowMs();
   const supabase = await createClient();
+  const tUser = nowMs();
   const {
     data: { user },
   } = await supabase.auth.getUser();
+  perfLog("layout.getUser", tUser);
   if (!user) redirect("/login");
 
   const result = await resolveActiveTenant();
+  perfLog("layout.total", tLayout);
 
   if (result.status === "select") {
     redirect("/tenant-select");

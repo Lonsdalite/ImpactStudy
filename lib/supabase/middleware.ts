@@ -53,9 +53,17 @@ export async function updateSession(request: NextRequest) {
   );
 
   // IMPORTANT: getUser() validates the session server-side. Don't use getSession().
+  // Timed inline rather than via lib/perf: that module is `server-only` and this
+  // runs in the middleware runtime (doc 42 baseline instrumentation).
+  const tUser = performance.now();
   const {
     data: { user },
   } = await supabase.auth.getUser();
+  if (process.env.PERF_LOG !== "0") {
+    console.log(
+      `[perf] middleware.getUser ${(performance.now() - tUser).toFixed(0)}ms path=${request.nextUrl.pathname}`,
+    );
+  }
 
   if (isProtectedPath(request.nextUrl.pathname) && !user) {
     const url = request.nextUrl.clone();

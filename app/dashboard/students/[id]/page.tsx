@@ -11,6 +11,7 @@ import {
   shortDate,
   todaySydney,
 } from "@/lib/billing";
+import { nowMs, perfLog } from "@/lib/perf";
 import { BillingSettingsForm } from "@/components/dashboard/billing-settings-form";
 import { UndoPaymentButton } from "@/components/dashboard/undo-payment-button";
 import { StudentAdmin } from "@/components/dashboard/student-admin";
@@ -139,6 +140,7 @@ export default async function StudentDetailPage({
   params: Promise<{ id: string }>;
   searchParams: Promise<{ tab?: string }>;
 }) {
+  const tPage = nowMs();
   const result = await resolveActiveTenant();
   if (result.status !== "ok") {
     redirect(result.status === "none" ? "/login" : "/tenant-select");
@@ -148,6 +150,7 @@ export default async function StudentDetailPage({
   const { tab: initialTab } = await searchParams;
 
   const supabase = await createClient();
+  const tStudent = nowMs();
   const { data: studentData } = await supabase
     .from("students")
     .select(
@@ -155,9 +158,11 @@ export default async function StudentDetailPage({
     )
     .eq("id", id)
     .single();
+  perfLog("page.student.q1_student", tStudent);
   if (!studentData) notFound();
   const student = studentData as unknown as StudentRow;
 
+  const tBatch = nowMs();
   const [
     { data: lessonData },
     { data: paymentData },
@@ -215,6 +220,7 @@ export default async function StudentDetailPage({
           .order("title", { ascending: true })
       : Promise.resolve({ data: [] as WorksheetOptionRow[] }),
   ]);
+  perfLog("page.student.q2_batch6", tBatch);
   const payments = (paymentData ?? []) as unknown as PaymentRow[];
   const enrollmentRows = (enrollmentData ?? []) as unknown as EnrollmentQueryRow[];
   const subjects = (subjectData ?? []) as unknown as SubjectOption[];
@@ -238,12 +244,15 @@ export default async function StudentDetailPage({
   // Current weekly slots (Slice B) for this student's enrollments — the recurring
   // pattern the calendar renders from. "Current" = active + not yet end-dated.
   const enrollmentIds = enrollmentRows.map((e) => e.id);
+  const tSchedules = nowMs();
   const { data: scheduleData } = isStaff && enrollmentIds.length
     ? await supabase
         .from("enrollment_schedules")
         .select("id, enrollment_id, weekday, start_time, duration_override, effective_to, active")
         .in("enrollment_id", enrollmentIds)
     : { data: [] as ScheduleQueryRow[] };
+  perfLog("page.student.q3_schedules", tSchedules);
+  perfLog("page.student.total", tPage);
   const scheduleRows = (scheduleData ?? []) as unknown as ScheduleQueryRow[];
   const slotsByEnrollment = new Map<string, ScheduleQueryRow[]>();
   for (const s of scheduleRows) {

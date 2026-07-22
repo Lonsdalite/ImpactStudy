@@ -3,12 +3,14 @@ import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { resolveActiveTenant } from "@/lib/tenant";
 import { formatMoney, monthBounds, monthLabel, todaySydney } from "@/lib/billing";
+import { nowMs, perfLog } from "@/lib/perf";
 
 export const metadata = {
   title: "Dashboard",
 };
 
 export default async function DashboardPage() {
+  const tPage = nowMs();
   const result = await resolveActiveTenant();
   if (result.status !== "ok") {
     redirect(result.status === "none" ? "/login" : "/tenant-select");
@@ -18,6 +20,7 @@ export default async function DashboardPage() {
   // Live count via the RLS path — owner/admin/tutor see the whole tenant; a
   // parent sees only their own children. This is the tenant-isolation proof.
   const supabase = await createClient();
+  const tQueries = nowMs();
   const { count } = await supabase
     .from("students")
     .select("id", { count: "exact", head: true })
@@ -42,6 +45,8 @@ export default async function DashboardPage() {
       0,
     );
   }
+  perfLog("page.overview.queries", tQueries);
+  perfLog("page.overview.total", tPage);
 
   return (
     <main className="flex-1 px-6 py-10 md:px-10">

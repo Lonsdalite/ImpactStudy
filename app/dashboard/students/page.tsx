@@ -9,6 +9,7 @@ import {
   type StudentListRow,
 } from "@/components/dashboard/student-list";
 import { formatMoney, nextCollection, shortDate, todaySydney } from "@/lib/billing";
+import { nowMs, perfLog } from "@/lib/perf";
 import type { BillingCycle } from "@/lib/db/schema";
 
 export const metadata = { title: "Students" };
@@ -29,6 +30,7 @@ export default async function StudentsPage({
 }: {
   searchParams: Promise<{ view?: string }>;
 }) {
+  const tPage = nowMs();
   const result = await resolveActiveTenant();
   if (result.status !== "ok") {
     redirect(result.status === "none" ? "/login" : "/tenant-select");
@@ -41,6 +43,7 @@ export default async function StudentsPage({
   const today = todaySydney();
 
   const supabase = await createClient();
+  const tQueries = nowMs();
   const { data } = await supabase
     .from("students")
     .select(
@@ -77,6 +80,8 @@ export default async function StudentsPage({
       });
     }
   }
+  perfLog("page.students.queries", tQueries);
+  perfLog("page.students.total", tPage);
 
   // Pre-format each row on the server (balance strings use the billing utils)
   // so the client list stays a dumb, filterable presenter.
