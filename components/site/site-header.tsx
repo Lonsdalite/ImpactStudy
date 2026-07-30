@@ -6,8 +6,14 @@ import Link from "next/link";
  * in the root layout, so it never appears on /login or /dashboard.
  */
 export function SiteHeader() {
+  // NOTE: no `display` utility here on purpose. Each link below sets its own
+  // (`hidden sm:inline-flex`). Tailwind v4 emits `.inline-flex` AFTER `.hidden`
+  // in the stylesheet, and both are single-class specificity — so a shared
+  // `inline-flex` in this string silently beats a per-link `hidden` and the
+  // links render at every width. That regression pushed "Sign in" off-screen on
+  // every phone (320-430px). Keep display utilities on the element itself.
   const navLink =
-    "inline-flex h-9 items-center rounded-full px-4 text-sm font-medium text-brand-plum/80 transition-colors hover:bg-brand-plum/[0.04] hover:text-brand-plum";
+    "h-9 items-center rounded-full px-4 text-sm font-medium text-brand-plum/80 transition-colors hover:bg-brand-plum/[0.04] hover:text-brand-plum";
 
   return (
     <header className="sticky top-0 z-40 w-full border-b border-brand-mist/70 bg-brand-cream/85 backdrop-blur">
@@ -41,7 +47,8 @@ export function SiteHeader() {
           </Link>
           <Link
             href="/login"
-            className="ml-1 inline-flex h-9 items-center justify-center rounded-full bg-brand-plum px-5 text-sm font-medium text-brand-cream transition-colors hover:bg-brand-plum-mid"
+            // h-11 on phones = 44px min tap target; unchanged (h-9) from sm up.
+            className="ml-1 inline-flex h-11 items-center justify-center rounded-full bg-brand-plum px-5 text-sm font-medium text-brand-cream transition-colors hover:bg-brand-plum-mid sm:h-9"
           >
             Sign in
           </Link>
