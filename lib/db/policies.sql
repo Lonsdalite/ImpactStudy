@@ -911,6 +911,27 @@ create policy corrections_delete_staff on public.corrections
 --                             fee_override (billing internals).
 --        parent_corrections : released feedback only. NO `items`, NO `stats`
 --                             (doc 26 §2D — feedback, never grades).
+--
+-- ⚠️ READ BEFORE "FIXING" THE SUPABASE SECURITY ADVISOR ⚠️
+--    Supabase's advisor flags both views as CRITICAL "Security Definer View".
+--    That finding is the REMEDIATION for doc 35b's P1 (parents could read
+--    lessons.note and corrections.items/stats), not a vulnerability. Fable's
+--    review recommended exactly this: "Views are the practical option since
+--    staff and parents share the `authenticated` role."
+--
+--    DO NOT set `security_invoker = true` to clear the warning. The base
+--    tables are staff-only for SELECT (§11 / §11d), so with invoker semantics
+--    a parent gets ZERO rows — win-cards, balances and student-detail history
+--    all go blank, and it reads like a data bug, not a security change.
+--
+--    Verified safe by live production probes with real parent JWTs at Slice
+--    B.5 (24/24, doc 35e): scoping exact per parent, forbidden columns absent.
+--    Safety rests on the WHERE clause below — auth.uid() still resolves to the
+--    CALLER even though the view runs as owner. There is no RLS policy
+--    underneath as a backstop, so treat these two definitions as
+--    security-critical: never widen the column list or weaken the predicate
+--    without re-review. `pnpm db:policies` asserts the forbidden columns stay
+--    out (apply-policies.ts).
 -- ----------------------------------------------------------------------------
 drop view if exists public.parent_lessons;
 create view public.parent_lessons
